@@ -283,8 +283,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            up.body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-            2048
+            up.body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "LOW"
+        );
+        assert!(
+            up.body["generationConfig"]["thinkingConfig"]
+                .get("thinkingBudget")
+                .is_none(),
+            "现行 GenAI 接口不再发送 thinkingBudget"
         );
         assert_eq!(
             up.body["generationConfig"]["thinkingConfig"]["includeThoughts"],

@@ -19,9 +19,10 @@ const MIN_THINKING_BUDGET: u32 = 1024;
 
 /// effort → token 预算档位。
 ///
-/// OpenAI 系用字符串枚举表达推理强度，而 Anthropic (`thinking.budget_tokens`) 与
-/// Gemini (`generationConfig.thinkingConfig.thinkingBudget`) 用**token 预算**表达，
-/// 故需要一张共用映射表把同一意图翻译成各家形态，避免四个 adapter 各写一份而漂移。
+/// OpenAI 系用字符串枚举表达推理强度，Anthropic（`thinking.budget_tokens`）用
+/// **token 预算**表达，Gemini 现行接口为 `thinkingLevel` 档位（历史 budget 形态
+/// 仅在入站解析时经本表逆推 effort）。共用一张映射表翻译同一意图，避免四个
+/// adapter 各写一份而漂移。
 const THINKING_BUDGETS: &[(&str, u32)] = &[
     ("minimal", 1024),
     ("low", 2048),

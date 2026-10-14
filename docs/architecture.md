@@ -680,7 +680,8 @@ M8 余额&健康看板（一次性 Lua 查询脚本 + 定时调度 + 多 key 在
   `reasoning_effort`、Responses 用 `reasoning.{effort,summary}`、Anthropic 默认用
   `thinking:{type:"adaptive"}` + `output_config.effort`，端点指定 `thinking_mode:"enabled"`
   时按 effort→预算表生成 `budget_tokens` 并按 `max_tokens` 收紧；Gemini 用
-  `generationConfig.thinkingConfig.{thinkingBudget,includeThoughts}`。effort→预算表共享于
+  `generationConfig.thinkingConfig.{thinkingLevel,includeThoughts}`（现行接口统一
+  档位制，只发 LOW/HIGH 公共子集；effort 为 `none` 时不下发）。effort→预算表共享于
   `adapters/mod.rs`。Anthropic 入站的 enabled/adaptive 均优先读取非空的
   `output_config.effort`；enabled 缺省时才从预算反推，最低档归为 `low`，adaptive
   缺省为 `high`。disabled/未知模式维持不下发 reasoning；不改变 Gemini 预算映射或

@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use crate::adapters::{clamped_thinking_budget, reasoning_effort};
+use crate::adapters::reasoning_effort;
 use moonbridge_core::{
     ContentBlock, CoreRequest, DocSource, Message, Role, StopReason, Tool, ToolChoice, Usage,
 };
@@ -248,10 +248,11 @@ pub fn core_to_contents(messages: &[Message]) -> Vec<Value> {
                         fr["id"] = json!(tool_use_id);
                     }
                     parts.push(json!({ "functionResponse": fr }));
-                    // functionResponse 只承载 JSON 文本：内嵌图片/文档提升为同一
-                    // user 回合的 inlineData/fileData part（Gemini 侧工具媒体
-                    // 结果的标准通道），附一行来源标注保持与 functionCall 的
-                    // 关联——否则经 text_of 静默丢弃后模型只看到空结果。
+                    // functionResponse 只承载 JSON 文本：内嵌图片/文档提升为
+                    // 同一消息内紧随的 inlineData/fileData part（Gemini 侧工具
+                    // 媒体结果的标准通道；经尾部拆分最终落入下一 user 回合），
+                    // 附一行来源标注保持与 functionCall 的关联——否则经
+                    // text_of 静默丢弃后模型只看到空结果。
                     let mut hoisted = false;
                     for b in content {
                         let part = match b {
@@ -319,10 +320,14 @@ pub fn core_to_contents(messages: &[Message]) -> Vec<Value> {
             }
         }
         flush_pending_sig(&mut parts, &mut pending_sig);
+        if m.role == Role::Assistant {
+            hoist_signature_to_first_function_call(&mut parts);
+        }
         if !parts.is_empty() {
-            // 连续 Tool 消息合并为单个 user content：官方要求当前回合内
-            // 所有 functionResponse 紧跟全部 functionCall，拆成多个 user
-            // 回合可能触发严格校验 400
+            // 连续 Tool 消息并入上一 user 回合：官方要求当前回合内所有
+            // functionResponse 紧跟全部 functionCall。混入的非 FR part
+            // （标注/媒体/提醒文本）由末尾的 split 统一收拢到后续回合，
+            // 这里无需限制合并目标的内容形态。
             let merged = m.role == Role::Tool
                 && out
                     .last()
@@ -342,7 +347,92 @@ pub fn core_to_contents(messages: &[Message]) -> Vec<Value> {
             }
         }
     }
+    split_mixed_function_response_turns(&mut out);
     out
+}
+
+/// part 上承载 thoughtSignature 的两个位置：part 级（thought/text part，
+/// 或 flush_pending_sig 落在 FC part 上的情形）与 functionCall 对象内。
+fn part_signature(p: &Value) -> Option<&Value> {
+    if let Some(s) = p.get("thoughtSignature") {
+        Some(s)
+    } else {
+        p["functionCall"].get("thoughtSignature")
+    }
+}
+
+/// gemini-4 代校验：当前轮次内每个模型步骤的**第一个 functionCall part
+/// 必须携带 thought_signature**（官方布局：有 FC 时签名只挂在首个 FC 上，
+/// 无 FC 时才落在最后一个 part）。历史经 Anthropic 等协议回传后签名常
+/// 留在 thought/text part 上（这些协议的 tool_use 无签名字段，签名只能
+/// 随 thinking 块走），或因块序异常落到后续 FC 上，导致 400
+/// "Function call is missing a thought_signature"。这里把回合内找到
+/// 的签名迁回首个 FC。
+fn hoist_signature_to_first_function_call(parts: &mut [Value]) {
+    let Some(first_fc) = parts
+        .iter()
+        .position(|p| p.get("functionCall").is_some())
+    else {
+        return;
+    };
+    if part_signature(&parts[first_fc]).is_some() {
+        return;
+    }
+    // 取回合内首个签名（位置靠前的优先——thinking 块回传的标准位置在
+    // FC 之前；仅在之前没有时才取之后 part 上的）
+    let Some(src) = parts.iter().position(|p| part_signature(p).is_some()) else {
+        return;
+    };
+    let sig = if parts[src].get("thoughtSignature").is_some() {
+        parts[src]
+            .as_object_mut()
+            .and_then(|p| p.remove("thoughtSignature"))
+    } else {
+        parts[src]["functionCall"]
+            .as_object_mut()
+            .and_then(|f| f.remove("thoughtSignature"))
+    };
+    if let Some(sig) = sig {
+        parts[first_fc]["functionCall"]["thoughtSignature"] = sig;
+    }
+}
+
+/// 上游（gemini-4 代校验）要求含 functionResponse 的 user 回合**纯净**：
+/// 混入 text/媒体 part（无论在 functionResponse 之前还是之后）都会触发
+/// 400——实测尾随 text 报 "Requests ending with a model turn"，前置 text
+/// 报 "missing thought_signature"（轮次边界判定被干扰）。将回合内全部
+/// 非 functionResponse part 按原相对顺序移到紧随其后的新 user 回合，
+/// 保持 functionCall → functionResponse 的相邻关系不被隔开。
+fn split_mixed_function_response_turns(out: &mut Vec<Value>) {
+    let mut i = 0;
+    while i < out.len() {
+        let is_user = out[i].get("role").and_then(Value::as_str) == Some("user");
+        if !is_user {
+            i += 1;
+            continue;
+        }
+        let Some(parts) = out[i].get_mut("parts").and_then(Value::as_array_mut) else {
+            i += 1;
+            continue;
+        };
+        let is_fr = |p: &Value| p.get("functionResponse").is_some();
+        if !parts.iter().any(is_fr) || parts.iter().all(is_fr) {
+            i += 1;
+            continue;
+        }
+        let mut frs: Vec<Value> = Vec::new();
+        let mut others: Vec<Value> = Vec::new();
+        for p in std::mem::take(parts) {
+            if is_fr(&p) {
+                frs.push(p);
+            } else {
+                others.push(p);
+            }
+        }
+        *parts = frs;
+        out.insert(i + 1, json!({ "role": "user", "parts": others }));
+        i += 2;
+    }
 }
 
 /// Core system（顶层 + system 角色消息）→ Gemini `systemInstruction`。
@@ -369,6 +459,137 @@ pub fn core_to_system_instruction(system: &[ContentBlock], messages: &[Message])
     }
 }
 
+/// Gemini `Schema` 支持的字段（OpenAPI 3.0 子集）。JSON Schema 专有字段
+/// （`$schema`、`additionalProperties`、`propertyNames`、`allOf` 等）会被上游
+/// 以 400 `Cannot find field` 整体拒绝，必须在转换时剥除。
+const SCHEMA_SUPPORTED_KEYS: &[&str] = &[
+    "type", "format", "title", "description", "nullable", "enum", "items", "properties",
+    "required", "anyOf", "propertyOrdering", "default", "example", "pattern", "minimum",
+    "maximum", "minLength", "maxLength", "minItems", "maxItems", "minProperties",
+    "maxProperties",
+];
+
+/// 剥除后会丢失约束的结构性字段（需记日志）；`$schema`/`additionalProperties`/
+/// `propertyNames` 等仅作元数据或默认即期望行为，剥除属预期，不记。
+const SCHEMA_STRUCTURAL_KEYS: &[&str] = &[
+    "allOf", "oneOf", "not", "if", "then", "else", "const", "$ref", "$defs",
+    "patternProperties", "dependentSchemas", "dependentRequired", "contains",
+];
+
+/// 递归清洗 JSON Schema 为 Gemini 可接受的 OpenAPI 子集：
+/// - 白名单字段保留；结构性字段剥除时记入 `dropped`（约束丢失，调用方记日志），
+///   元数据字段静默剥除；
+/// - 数值型 `exclusiveMinimum`/`exclusiveMaximum`（JSON Schema 2020-12）放宽为
+///   闭区间 `minimum`/`maximum`，与显式 `minimum`/`maximum` 并存时取更严格者
+///   （布尔形态随 draft-07 的 `minimum`/`maximum` 一并保留，本身丢弃）；
+/// - `type` 联合形态（`["string","null"]`）归一为首类型 + `nullable`，单独
+///   `"null"` 转为 `nullable: true`（Gemini 的 type 是单值枚举）；
+/// - 仅向 schema 位置（`properties` 的值、`items`、`anyOf` 元素）递归，
+///   `default`/`example`/`enum` 中的实例数据原样保留。
+///
+/// `dropped` 收集被剥除的结构性字段与降级形态，供调用方记日志。
+fn sanitize_schema_logged<'a>(schema: &'a Value, dropped: &mut Vec<String>) -> Value {
+    let Value::Object(map) = schema else {
+        return schema.clone();
+    };
+    let mut out = serde_json::Map::new();
+    // 数值型 exclusive 边界先暂存，循环结束后与显式 minimum/maximum 合并取严
+    let mut excl_min: Option<&'a Value> = None;
+    let mut excl_max: Option<&'a Value> = None;
+    for (k, v) in map {
+        match k.as_str() {
+            "exclusiveMinimum" => {
+                if v.is_number() {
+                    excl_min = Some(v);
+                }
+            }
+            "exclusiveMaximum" => {
+                if v.is_number() {
+                    excl_max = Some(v);
+                }
+            }
+            "type" => match v {
+                Value::String(t) if t == "null" => {
+                    out.insert("nullable".to_string(), json!(true));
+                }
+                Value::String(_) => {
+                    out.insert(k.clone(), v.clone());
+                }
+                Value::Array(ts) => {
+                    let mut non_null = ts.iter().filter_map(|t| t.as_str()).filter(|t| *t != "null");
+                    if let Some(first) = non_null.next() {
+                        if non_null.next().is_some() {
+                            dropped.push("type(联合降级为首类型)".to_string());
+                        }
+                        out.insert("type".to_string(), json!(first));
+                    }
+                    if ts.iter().any(|t| t.as_str() == Some("null")) {
+                        out.insert("nullable".to_string(), json!(true));
+                    }
+                }
+                _ => {}
+            },
+            "properties" => match v.as_object() {
+                Some(m) => {
+                    let props = m
+                        .iter()
+                        .map(|(pk, pv)| (pk.clone(), sanitize_schema_logged(pv, dropped)))
+                        .collect();
+                    out.insert(k.clone(), Value::Object(props));
+                }
+                None => dropped.push("properties(非对象，已丢弃)".to_string()),
+            },
+            // tuple 形态（数组）Gemini 不支持：多元素约束无法表达，丢弃而非误留
+            "items" if v.is_object() => {
+                out.insert(k.clone(), sanitize_schema_logged(v, dropped));
+            }
+            "items" => {
+                dropped.push("items(非单 schema，已丢弃)".to_string());
+            }
+            "anyOf" => match v.as_array() {
+                Some(arr) => {
+                    let cleaned = arr
+                        .iter()
+                        .map(|s| sanitize_schema_logged(s, dropped))
+                        .collect();
+                    out.insert(k.clone(), Value::Array(cleaned));
+                }
+                None => dropped.push("anyOf(非数组，已丢弃)".to_string()),
+            },
+            _ if SCHEMA_SUPPORTED_KEYS.contains(&k.as_str()) => {
+                out.insert(k.clone(), v.clone());
+            }
+            _ if SCHEMA_STRUCTURAL_KEYS.contains(&k.as_str()) => {
+                dropped.push(k.clone());
+            }
+            _ => {}
+        }
+    }
+    // 合并 exclusive 边界：与显式 minimum/maximum 取更严格者（下界取大、上界
+    // 取小）；比较经 f64，落盘保留原 JSON 数值类型（避免整数被写成 5.0）
+    if let Some(eb) = excl_min {
+        let stricter = match (out.get("minimum").and_then(|m| m.as_f64()), eb.as_f64()) {
+            (Some(m), Some(e)) => e > m,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if stricter {
+            out.insert("minimum".to_string(), eb.clone());
+        }
+    }
+    if let Some(eb) = excl_max {
+        let stricter = match (out.get("maximum").and_then(|m| m.as_f64()), eb.as_f64()) {
+            (Some(m), Some(e)) => e < m,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if stricter {
+            out.insert("maximum".to_string(), eb.clone());
+        }
+    }
+    Value::Object(out)
+}
+
 /// Core tools → Gemini `tools`（单层 functionDeclarations 数组）。
 pub fn core_to_tools(tools: &[Tool]) -> Option<Value> {
     if tools.is_empty() {
@@ -377,7 +598,22 @@ pub fn core_to_tools(tools: &[Tool]) -> Option<Value> {
     let decls: Vec<Value> = tools
         .iter()
         .map(|t| {
-            let mut d = json!({ "name": t.name, "parameters": t.input_schema });
+            let mut dropped = Vec::new();
+            let params = sanitize_schema_logged(&t.input_schema, &mut dropped);
+            if !dropped.is_empty() {
+                tracing::warn!(
+                    tool = %t.name,
+                    ?dropped,
+                    "工具 schema 含 Gemini 不支持的结构性字段，已剥除（对应约束丢失）"
+                );
+            }
+            // 非对象 parameters（如显式 null）归一为空对象 schema，与入站解析口径一致
+            let params = if params.is_object() {
+                params
+            } else {
+                json!({ "type": "object" })
+            };
+            let mut d = json!({ "name": t.name, "parameters": params });
             if let Some(desc) = &t.description {
                 d["description"] = json!(desc);
             }
@@ -418,13 +654,25 @@ pub fn core_to_generation_config(req: &CoreRequest) -> Option<Value> {
     if !req.stop.is_empty() {
         obj.insert("stopSequences".to_string(), json!(req.stop));
     }
-    // 推理强度：Gemini 用 generationConfig.thinkingConfig.thinkingBudget 表达
+    // 推理强度：现行 GenAI 接口统一为 thinkingLevel 档位（thinkingBudget 已
+    // 退出）。只发 LOW/HIGH——官方文档中全模型的公共子集（gemini-3-pro-preview
+    // 仅低/高两档，MEDIUM 会被 400 拒绝），更细粒度按方向就近归入
     if let Some(effort) = reasoning_effort(req) {
-        let max_tokens = req.max_tokens.unwrap_or(u32::MAX);
-        if let Some(budget) = clamped_thinking_budget(effort, max_tokens) {
+        let level = match effort.to_ascii_lowercase().as_str() {
+            // OpenAI reasoning_effort=none 意为关闭思考；Gemini 侧最接近的
+            // 形态是不下发 thinkingConfig（模型默认动态思考），绝不能反向放大
+            "none" => None,
+            "minimal" | "low" => Some("LOW"),
+            "medium" | "high" | "xhigh" | "max" => Some("HIGH"),
+            other => {
+                tracing::warn!(effort = other, "未知推理强度档位，按 HIGH 下发");
+                Some("HIGH")
+            }
+        };
+        if let Some(level) = level {
             obj.insert(
                 "thinkingConfig".to_string(),
-                json!({ "thinkingBudget": budget, "includeThoughts": true }),
+                json!({ "thinkingLevel": level, "includeThoughts": true }),
             );
         }
     }
@@ -1196,6 +1444,178 @@ mod tests {
         assert_eq!(parts[0]["thoughtSignature"], "S");
     }
 
+    /// gemini-4 代校验：模型回合含 functionCall 时，thought_signature 必须
+    /// 挂在首个 functionCall 上——历史经 Anthropic 回传后签名常留在
+    /// thinking 对应的 thought part 上，须迁移，否则 400。
+    #[test]
+    fn signature_on_thought_part_hoists_to_first_function_call() {
+        let tool_use = |id: &str| ContentBlock::ToolUse {
+            id: id.into(),
+            item_id: None,
+            name: "Bash".into(),
+            namespace: None,
+            input: json!({}),
+            signature: None,
+        };
+        let msgs = vec![
+            Message::text(Role::User, "q"),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Reasoning {
+                        text: "thinking…".into(),
+                        signature: Some("gem:SIG".into()),
+                        redacted: false,
+                    },
+                    tool_use("c1"),
+                    tool_use("c2"),
+                ],
+                ext: Default::default(),
+            },
+        ];
+        let contents = core_to_contents(&msgs);
+        let parts = contents[1]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 3);
+        assert!(
+            parts[0].get("thoughtSignature").is_none(),
+            "签名应迁离 thought part: {parts:?}"
+        );
+        assert_eq!(
+            parts[1]["functionCall"]["thoughtSignature"],
+            "SIG",
+            "首个 functionCall 应携带签名"
+        );
+        assert!(
+            parts[2]["functionCall"].get("thoughtSignature").is_none(),
+            "并行调用的后续 FC 不带签名"
+        );
+    }
+
+    /// 首个 functionCall 自带签名时不做迁移（其它 part 的签名保持原位）。
+    #[test]
+    fn existing_function_call_signature_is_not_rewritten() {
+        let msgs = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Reasoning {
+                    text: "thinking…".into(),
+                    signature: Some("gem:THOUGHT_SIG".into()),
+                    redacted: false,
+                },
+                ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    item_id: None,
+                    name: "Bash".into(),
+                    namespace: None,
+                    input: json!({}),
+                    signature: Some("gem:FC_SIG".into()),
+                },
+            ],
+            ext: Default::default(),
+        }];
+        let contents = core_to_contents(&msgs);
+        let parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["thoughtSignature"], "THOUGHT_SIG");
+        assert_eq!(parts[1]["functionCall"]["thoughtSignature"], "FC_SIG");
+    }
+
+    /// 审查回归：签名落在后续 FC 上（仅凭据载体错位到第二个 ToolUse）
+    /// 时仍须迁回首个 FC——否则首个 FC 无签名，触发上游 400。
+    #[test]
+    fn signature_on_later_function_call_moves_to_first() {
+        let tool_use = |id: &str| ContentBlock::ToolUse {
+            id: id.into(),
+            item_id: None,
+            name: "Bash".into(),
+            namespace: None,
+            input: json!({}),
+            signature: None,
+        };
+        let msgs = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                tool_use("c1"),
+                ContentBlock::Reasoning {
+                    text: String::new(),
+                    signature: Some("gem:SIG".into()),
+                    redacted: false,
+                },
+                tool_use("c2"),
+            ],
+            ext: Default::default(),
+        }];
+        let contents = core_to_contents(&msgs);
+        let parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(
+            parts[0]["functionCall"]["thoughtSignature"],
+            "SIG",
+            "首个 FC 应拿到签名: {parts:?}"
+        );
+        assert!(
+            parts[1]["functionCall"].get("thoughtSignature").is_none()
+                && parts[1].get("thoughtSignature").is_none(),
+            "签名不得重复滞留: {parts:?}"
+        );
+    }
+
+    /// 审查回归：并行工具结果带媒体时，连续 Tool 消息先合并、再由末尾
+    /// 拆分收拢——functionResponse 回合纯净且与 functionCall 回合相邻，
+    /// 媒体 part 统一进入紧随其后的 user 回合。
+    #[test]
+    fn parallel_tool_results_with_media_merge_then_split() {
+        let tool_use = |id: &str| ContentBlock::ToolUse {
+            id: id.into(),
+            item_id: None,
+            name: "Bash".into(),
+            namespace: None,
+            input: json!({}),
+            signature: None,
+        };
+        let msgs = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![tool_use("c1"), tool_use("c2")],
+                ext: Default::default(),
+            },
+            Message {
+                role: Role::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "c1".into(),
+                    content: vec![
+                        ContentBlock::text("shot"),
+                        ContentBlock::Image {
+                            data: "AAA".into(),
+                            media_type: "image/png".into(),
+                        },
+                    ],
+                    is_error: false,
+                }],
+                ext: Default::default(),
+            },
+            Message {
+                role: Role::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "c2".into(),
+                    content: vec![ContentBlock::text("ok")],
+                    is_error: false,
+                }],
+                ext: Default::default(),
+            },
+        ];
+        let contents = core_to_contents(&msgs);
+        assert_eq!(contents.len(), 3, "FR 回合 + 媒体回合: {contents:?}");
+        let fr_parts = contents[1]["parts"].as_array().unwrap();
+        assert_eq!(
+            fr_parts.iter().filter(|p| p.get("functionResponse").is_some()).count(),
+            2,
+            "两个 functionResponse 必须在同一纯净回合: {fr_parts:?}"
+        );
+        assert_eq!(fr_parts.len(), 2);
+        let media_parts = contents[2]["parts"].as_array().unwrap();
+        assert_eq!(media_parts[0]["text"], "[media content returned by function call Bash]");
+        assert_eq!(media_parts[1]["inlineData"]["data"], "AAA");
+    }
+
     /// 连续 Tool 消息合并为单个 user content（官方：FR 紧跟全部 FC，
     /// 拆多个 user 回合可能触发严格校验 400）。
     #[test]
@@ -1249,6 +1669,101 @@ mod tests {
         assert_eq!(contents[2]["parts"].as_array().unwrap().len(), 2);
     }
 
+    /// 回归：tool_result 之后同消息再跟 text（如 harness 注入的提醒）时，
+    /// functionResponse 独占 user 回合、尾随 text 拆为紧随的独立 user
+    /// 回合——同回合混排会触发上游 400 "Requests ending with a model turn"。
+    #[test]
+    fn trailing_text_after_tool_results_splits_into_new_user_turn() {
+        let tool_use = |id: &str| ContentBlock::ToolUse {
+            id: id.into(),
+            item_id: None,
+            name: "Bash".into(),
+            namespace: None,
+            input: json!({}),
+            signature: None,
+        };
+        let tool_result = |id: &str| ContentBlock::ToolResult {
+            tool_use_id: id.into(),
+            content: vec![ContentBlock::text("ok")],
+            is_error: false,
+        };
+        let msgs = vec![
+            Message::text(Role::User, "q"),
+            Message {
+                role: Role::Assistant,
+                content: vec![tool_use("c1"), tool_use("c2")],
+                ext: Default::default(),
+            },
+            Message {
+                role: Role::User,
+                content: vec![
+                    tool_result("c1"),
+                    tool_result("c2"),
+                    ContentBlock::text("reminder"),
+                ],
+                ext: Default::default(),
+            },
+        ];
+        let contents = core_to_contents(&msgs);
+        assert_eq!(contents.len(), 4, "尾随 text 应拆为独立回合: {contents:?}");
+        let fr_parts = contents[2]["parts"].as_array().unwrap();
+        assert_eq!(contents[2]["role"], "user");
+        assert!(
+            fr_parts.iter().all(|p| p.get("functionResponse").is_some()),
+            "functionResponse 回合不得混入其他 part: {fr_parts:?}"
+        );
+        assert_eq!(fr_parts.len(), 2);
+        assert_eq!(contents[3]["role"], "user");
+        assert_eq!(
+            contents[3]["parts"].as_array().unwrap(),
+            &vec![json!({ "text": "reminder" })]
+        );
+    }
+
+    /// 回归：text 位于 tool_result 之前的混合回合同样拆分——非
+    /// functionResponse part 统一移到后续独立 user 回合，避免干扰上游的
+    /// 轮次边界判定（实测报 400 "missing thought_signature"）。
+    #[test]
+    fn leading_text_before_tool_results_moves_after_function_response_turn() {
+        let msgs = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    item_id: None,
+                    name: "Bash".into(),
+                    namespace: None,
+                    input: json!({}),
+                    signature: None,
+                }],
+                ext: Default::default(),
+            },
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::text("note"),
+                    ContentBlock::ToolResult {
+                        tool_use_id: "c1".into(),
+                        content: vec![ContentBlock::text("ok")],
+                        is_error: false,
+                    },
+                ],
+                ext: Default::default(),
+            },
+        ];
+        let contents = core_to_contents(&msgs);
+        assert_eq!(contents.len(), 3, "前置 text 应移到 FR 回合之后: {contents:?}");
+        let fr_parts = contents[1]["parts"].as_array().unwrap();
+        assert!(
+            fr_parts.iter().all(|p| p.get("functionResponse").is_some()),
+            "FR 回合必须纯净: {fr_parts:?}"
+        );
+        assert_eq!(
+            contents[2]["parts"].as_array().unwrap(),
+            &vec![json!({ "text": "note" })]
+        );
+    }
+
     /// 载体凭据迁移：空文本 Reasoning{sig} 紧邻 ToolUse 之前 → 签名落到
     /// functionCall part（非 Gemini 入口回传的标准形态）；异源凭据不迁移。
     #[test]
@@ -1292,7 +1807,7 @@ mod tests {
     }
 
     /// 回归：ToolResult 内嵌图片不得经 `text_of` 丢弃成空 functionResponse——
-    /// functionResponse 只承载 JSON 文本，图片提升为同一 user 回合的
+    /// functionResponse 只承载 JSON 文本，图片提升为紧随 user 回合的
     /// inlineData part（Gemini 侧工具图片结果的标准通道），附来源标注；
     /// url 形态与顶层 Image 分支同口径跳过。
     #[test]
@@ -1336,26 +1851,30 @@ mod tests {
             },
         ];
         let contents = core_to_contents(&msgs);
-        assert_eq!(contents.len(), 3);
-        let parts = contents[2]["parts"].as_array().unwrap();
-        // functionResponse 文本保留 + 一条标注 + 两张 base64 图（url 跳过）
+        // functionResponse 独占回合；标注与媒体 part 拆入紧随的 user 回合
+        // （gemini-4 代校验拒绝 functionResponse 后同回合再跟其他 part）
+        assert_eq!(contents.len(), 4);
+        let fr_parts = contents[2]["parts"].as_array().unwrap();
         assert_eq!(
-            parts[0],
+            fr_parts[0],
             json!({ "functionResponse": { "name": "read_file", "response": { "result": "image below" }, "id": "c1" } })
         );
+        assert_eq!(fr_parts.len(), 1);
+        let media_parts = contents[3]["parts"].as_array().unwrap();
+        assert_eq!(contents[3]["role"], "user");
         assert_eq!(
-            parts[1],
+            media_parts[0],
             json!({ "text": "[media content returned by function call read_file]" })
         );
         assert_eq!(
-            parts[2],
+            media_parts[1],
             json!({ "inlineData": { "mimeType": "image/png", "data": "AAA" } })
         );
         assert_eq!(
-            parts[3],
+            media_parts[2],
             json!({ "inlineData": { "mimeType": "image/jpeg", "data": "BBB" } })
         );
-        assert_eq!(parts.len(), 4, "url 形态图片不下发: {parts:?}");
+        assert_eq!(media_parts.len(), 3, "url 形态图片不下发: {media_parts:?}");
     }
 
     /// 回归：fileData part（Files API 引用）不得静默丢弃——映射为 Uri 源
@@ -1610,21 +2129,25 @@ mod tests {
             ext: Default::default(),
         }];
         let contents = core_to_contents(&msgs);
-        let parts = contents[0]["parts"].as_array().unwrap();
+        // functionResponse 独占 contents[0]，标注与文档 part 拆入 contents[1]
+        assert_eq!(contents.len(), 2);
+        let fr_parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(fr_parts.len(), 1);
         assert_eq!(
-            parts[0]["functionResponse"]["response"]["result"],
+            fr_parts[0]["functionResponse"]["response"]["result"],
             "see doc"
         );
+        let parts = contents[1]["parts"].as_array().unwrap();
         assert_eq!(
-            parts[1],
+            parts[0],
             json!({ "text": "[media content returned by function call f]" })
         );
         assert_eq!(
-            parts[2],
+            parts[1],
             json!({ "fileData": { "fileUri": "https://x/d.pdf", "mimeType": "application/pdf" } })
         );
         assert_eq!(
-            parts[3],
+            parts[2],
             json!({ "inlineData": { "mimeType": "application/pdf", "data": "PP" } })
         );
     }
@@ -1675,5 +2198,172 @@ mod tests {
         let out = usage_object(&u);
         assert_eq!(out["totalTokenCount"], 16);
         assert_eq!(out["thoughtsTokenCount"], 4);
+    }
+
+    /// 收集 schema 位置中出现的全部对象键（用于递归断言违禁字段已被剥除）。
+    /// `default`/`example`/`enum` 是实例数据而非 schema，不向下递归。
+    fn collect_keys(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::Object(m) => {
+                for (k, val) in m {
+                    out.push(k.clone());
+                    if matches!(k.as_str(), "default" | "example" | "enum") {
+                        continue;
+                    }
+                    collect_keys(val, out);
+                }
+            }
+            Value::Array(arr) => arr.iter().for_each(|x| collect_keys(x, out)),
+            _ => {}
+        }
+    }
+
+    /// Kimi Code 等客户端的工具 schema 是完整 JSON Schema（draft-07/2020-12），
+    /// `$schema`、`additionalProperties`、`propertyNames`、数值型 exclusive 边界
+    /// 会被 Gemini 以 400 `Cannot find field` 整体拒绝，必须清洗为 OpenAPI 子集。
+    #[test]
+    fn tools_schema_sanitized_to_openapi_subset() {
+        let tools = vec![Tool {
+            name: "ask".into(),
+            description: Some("d".into()),
+            ext: Default::default(),
+            input_schema: json!({
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "timeout": {
+                        "type": "integer",
+                        "exclusiveMinimum": 0,
+                        "description": "秒"
+                    },
+                    "ids": {
+                        "type": "array",
+                        "items": { "type": "string", "propertyNames": {} }
+                    },
+                    "choice": {
+                        "anyOf": [
+                            { "type": "string", "exclusiveMaximum": 5 },
+                            { "type": "null" }
+                        ]
+                    },
+                    "meta": {
+                        "type": "object",
+                        // default 是实例数据而非 schema，其中的键不得被清洗
+                        "default": { "additionalProperties": true, "note": "keep" }
+                    }
+                },
+                "required": ["timeout"]
+            }),
+        }];
+        let out = core_to_tools(&tools).unwrap();
+        let params = &out[0]["functionDeclarations"][0]["parameters"];
+
+        let mut keys = Vec::new();
+        collect_keys(&out, &mut keys);
+        for banned in ["$schema", "additionalProperties", "propertyNames", "exclusiveMinimum", "exclusiveMaximum"] {
+            assert!(!keys.iter().any(|k| k == banned), "违禁字段应被剥除: {banned}");
+        }
+
+        // 数值型 exclusive 边界放宽为闭区间
+        assert_eq!(params["properties"]["timeout"]["minimum"], 0);
+        assert_eq!(params["properties"]["choice"]["anyOf"][0]["maximum"], 5);
+        // 单独 "null" 类型归一为 nullable（Gemini 的 type 是单值枚举）
+        assert_eq!(params["properties"]["choice"]["anyOf"][1], json!({ "nullable": true }));
+        // 嵌套 schema 位置递归清洗
+        assert_eq!(params["properties"]["ids"]["items"]["type"], "string");
+        // 支持字段与实例数据原样保留
+        assert_eq!(params["type"], "object");
+        assert_eq!(params["required"], json!(["timeout"]));
+        assert_eq!(
+            params["properties"]["meta"]["default"],
+            json!({ "additionalProperties": true, "note": "keep" }),
+            "default 中的实例数据不得按 schema 清洗"
+        );
+    }
+
+    /// draft-07 布尔形态 exclusiveMinimum 本身丢弃，同行的 minimum 保留。
+    #[test]
+    fn boolean_exclusive_bound_dropped_but_minimum_kept() {
+        let tools = vec![Tool {
+            name: "t".into(),
+            description: None,
+            ext: Default::default(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "n": { "type": "integer", "minimum": 1, "exclusiveMinimum": true }
+                }
+            }),
+        }];
+        let out = core_to_tools(&tools).unwrap();
+        let n = &out[0]["functionDeclarations"][0]["parameters"]["properties"]["n"];
+        assert_eq!(n["minimum"], 1);
+        assert!(n.get("exclusiveMinimum").is_none());
+    }
+
+    /// type 联合形态归一为首类型 + nullable；exclusive 边界与显式
+    /// minimum/maximum 并存时取更严格者（与 key 书写顺序无关）。
+    #[test]
+    fn type_union_and_exclusive_bounds_normalized() {
+        fn sanitize(s: Value) -> Value {
+            sanitize_schema_logged(&s, &mut Vec::new())
+        }
+        assert_eq!(
+            sanitize(json!({"type": ["string", "null"]})),
+            json!({"type": "string", "nullable": true})
+        );
+        assert_eq!(sanitize(json!({"type": "null"})), json!({"nullable": true}));
+        assert_eq!(
+            sanitize(json!({"type": ["string", "integer"]})),
+            json!({"type": "string"}),
+            "多非 null 联合降级为首类型（Gemini 无法表达联合类型）"
+        );
+        // 合并取严：下界取大、上界取小，与书写顺序无关
+        for s in [
+            json!({"minimum": 0, "exclusiveMinimum": 5}),
+            json!({"exclusiveMinimum": 5, "minimum": 0}),
+        ] {
+            assert_eq!(sanitize(s)["minimum"], 5);
+        }
+        for s in [
+            json!({"maximum": 100, "exclusiveMaximum": 5}),
+            json!({"exclusiveMaximum": 5, "maximum": 100}),
+        ] {
+            assert_eq!(sanitize(s)["maximum"], 5);
+        }
+    }
+
+    /// 现行 GenAI 接口统一为 thinkingLevel 档位（thinkingBudget 已退出）；
+    /// 与模型代际无关，只发 LOW/HIGH 公共子集。
+    #[test]
+    fn thinking_config_always_emits_level() {
+        fn req_with_effort(model: &str, effort: &str) -> CoreRequest {
+            let mut req = CoreRequest::new(model);
+            req.max_tokens = Some(32000);
+            req.reasoning = Some(moonbridge_core::Reasoning {
+                effort: Some(effort.into()),
+                summary: None,
+            });
+            req
+        }
+
+        let gc = core_to_generation_config(&req_with_effort("gemini-4-argon", "high")).unwrap();
+        assert_eq!(gc["thinkingConfig"]["thinkingLevel"], "HIGH");
+        assert!(gc["thinkingConfig"].get("thinkingBudget").is_none());
+
+        // 档位映射与模型名无关：minimal/low → LOW，medium/high/xhigh/max → HIGH
+        for (effort, level) in [("minimal", "LOW"), ("low", "LOW"), ("medium", "HIGH"), ("xhigh", "HIGH")] {
+            let gc = core_to_generation_config(&req_with_effort("gemini-2.5-pro", effort)).unwrap();
+            assert_eq!(gc["thinkingConfig"]["thinkingLevel"], level, "effort={effort}");
+            assert!(gc["thinkingConfig"].get("thinkingBudget").is_none());
+        }
+
+        // none 意为关闭思考：不下发 thinkingConfig（绝不能反向放大为 HIGH）
+        let gc = core_to_generation_config(&req_with_effort("gemini-4-argon", "none")).unwrap();
+        assert!(gc.get("thinkingConfig").is_none());
+        // 未知档位按 HIGH 下发（记 warn 日志）
+        let gc = core_to_generation_config(&req_with_effort("gemini-4-argon", "ultra")).unwrap();
+        assert_eq!(gc["thinkingConfig"]["thinkingLevel"], "HIGH");
     }
 }
