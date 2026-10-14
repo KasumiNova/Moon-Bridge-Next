@@ -594,7 +594,10 @@ mod tests {
             usage: Default::default(),
             ext: Default::default(),
         };
-        assert!(tag_response(&mut resp, UUID), "tool_use 轮含推理块也应打标记");
+        assert!(
+            tag_response(&mut resp, UUID),
+            "tool_use 轮含推理块也应打标记"
+        );
         let ContentBlock::Reasoning {
             text: think,
             signature,

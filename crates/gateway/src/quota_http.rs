@@ -458,9 +458,8 @@ mod tests {
             let error = policy.request(url, request(url)).await.unwrap_err();
             assert!(error.contains("私网"), "{url}: {error}");
         }
-        let denied = QuotaNetworkPolicy::from_environment(Some(
-            "http://secret-token@proxy.example".into(),
-        ));
+        let denied =
+            QuotaNetworkPolicy::from_environment(Some("http://secret-token@proxy.example".into()));
         let error = denied
             .request("http://127.0.0.1", request("http://127.0.0.1"))
             .await

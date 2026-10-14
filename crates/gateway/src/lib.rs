@@ -47,9 +47,9 @@ pub use quota::{
     SCHEDULE_TICK,
 };
 // 供管理面在保存/导入插件时沙箱求值 `MB` 清单（category/config_schema）。
-pub use moonbridge_plugin::LuaRuntime as PluginLuaRuntime;
 pub use config::GatewayConfig;
 pub use error::{GatewayError, Result};
+pub use moonbridge_plugin::LuaRuntime as PluginLuaRuntime;
 pub use state::AppState;
 
 use crate::bridge::GatewayBridge;

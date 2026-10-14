@@ -12,9 +12,7 @@ use std::time::{Duration, Instant};
 use axum::routing::post;
 use axum::{Json, Router};
 use moonbridge_gateway::{run_quota_loop, QuotaEngine, QuotaNetworkPolicy};
-use moonbridge_store::{
-    Database, Endpoint, PluginRecord, Provider, QuotaKeyResult, QuotaResult,
-};
+use moonbridge_store::{Database, Endpoint, PluginRecord, Provider, QuotaKeyResult, QuotaResult};
 use serde_json::{json, Value};
 
 /// 成功脚本：给出 used_percent，验证引擎补齐 left_percent。
@@ -90,11 +88,7 @@ fn bound_provider(key: &str, plugin_ref: &str, endpoints: &[(&str, &str)]) -> Pr
 /// 便捷路径：注册 `SCRIPT_OK` 插件并返回绑定的单端点 Provider。
 fn ok_provider(db: &Database, key: &str) -> Provider {
     plugin(db, "quota-ok", SCRIPT_OK);
-    bound_provider(
-        key,
-        "quota-ok",
-        &[("https://api.example.test", "sk-test")],
-    )
+    bound_provider(key, "quota-ok", &[("https://api.example.test", "sk-test")])
 }
 
 fn engine(db: &Arc<Database>, plugins_dir: Option<PathBuf>) -> QuotaEngine {
@@ -328,8 +322,7 @@ async fn mb_http_real_roundtrip_complements_percent() {
 #[tokio::test]
 async fn script_ref_outside_plugins_dir_is_rejected() {
     let db = Arc::new(Database::open_in_memory().unwrap());
-    let dir =
-        std::env::temp_dir().join(format!("moonbridge-quota-plugins-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("moonbridge-quota-plugins-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     // 越界文件真实存在：拒绝必须来自路径包含性校验，而不是「读不到文件」
     let outside = std::env::temp_dir().join(format!(
@@ -565,7 +558,10 @@ async fn per_key_failure_is_independent() {
     let p = bound_provider(
         "kimi",
         "quota-flaky",
-        &[("https://a", "sk-alpha-0001"), ("https://b", "sk-beta-00002")],
+        &[
+            ("https://a", "sk-alpha-0001"),
+            ("https://b", "sk-beta-00002"),
+        ],
     );
 
     let results = engine(&db, None).run_provider(&p).await.unwrap();
@@ -594,7 +590,10 @@ async fn engine_failure_keeps_payload_per_key() {
     let p = bound_provider(
         "kimi",
         "quota-swap",
-        &[("https://a", "sk-alpha-0001"), ("https://b", "sk-beta-00002")],
+        &[
+            ("https://a", "sk-alpha-0001"),
+            ("https://b", "sk-beta-00002"),
+        ],
     );
     let eng = engine(&db, None);
 
@@ -638,7 +637,10 @@ async fn shrinking_endpoints_prunes_stale_rows() {
     let mut p = bound_provider(
         "kimi",
         "quota-ok",
-        &[("https://a", "sk-alpha-0001"), ("https://b", "sk-beta-00002")],
+        &[
+            ("https://a", "sk-alpha-0001"),
+            ("https://b", "sk-beta-00002"),
+        ],
     );
     db.upsert_provider(&p).unwrap();
     let eng = engine(&db, None);
@@ -661,7 +663,10 @@ async fn refresh_provider_reruns_all_endpoints() {
     let p = bound_provider(
         "one",
         "quota-ok",
-        &[("https://a", "sk-alpha-0001"), ("https://b", "sk-beta-00002")],
+        &[
+            ("https://a", "sk-alpha-0001"),
+            ("https://b", "sk-beta-00002"),
+        ],
     );
     db.upsert_provider(&p).unwrap();
     let eng = engine(&db, None);
@@ -818,7 +823,10 @@ async fn test_provider_runs_without_persisting() {
     let p = bound_provider(
         "drymulti",
         "quota-ok",
-        &[("https://a", "sk-alpha-0001"), ("https://b", "sk-beta-00002")],
+        &[
+            ("https://a", "sk-alpha-0001"),
+            ("https://b", "sk-beta-00002"),
+        ],
     );
     let results = eng.test_provider(&p).await;
     assert_eq!(results.len(), 2, "dry-run 也按端点拆结果");

@@ -33,8 +33,8 @@ use moonbridge_store::{
 };
 use serde_json::{json, Value};
 
-pub use crate::quota_http::QuotaNetworkPolicy;
 use crate::parse_script_ref;
+pub use crate::quota_http::QuotaNetworkPolicy;
 use crate::ScriptRef;
 
 /// 单次查询的整体超时（含脚本加载 + `MB.query` 执行）。
@@ -195,16 +195,16 @@ impl QuotaEngine {
         provider: &Provider,
     ) -> moonbridge_store::Result<ProviderQuotaView> {
         self.run_provider(provider).await?;
-        Ok(view_of(&self.db, &provider.key)?.unwrap_or_else(|| {
-            ProviderQuotaView {
+        Ok(
+            view_of(&self.db, &provider.key)?.unwrap_or_else(|| ProviderQuotaView {
                 provider_key: provider.key.clone(),
                 quota_plugin_ref: provider.quota_plugin_ref.clone(),
                 quota_interval_secs: provider.quota_interval_secs,
                 quota_enabled: provider.quota_enabled,
                 key_count: provider.endpoints.len() as i64,
                 results: Vec::new(),
-            }
-        }))
+            }),
+        )
     }
 
     /// 试运行一个 Provider 的配额查询：不写入数据库、不读历史结果，所有失败仅返回预览。
@@ -449,7 +449,11 @@ fn normalize_quotas(ret: &Value) -> Value {
     let mut warnings: Vec<String> = ret
         .get("warnings")
         .and_then(Value::as_array)
-        .map(|w| w.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|w| {
+            w.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     for (i, item) in items.iter().enumerate() {
         let label = item
@@ -508,18 +512,54 @@ fn normalize_quotas(ret: &Value) -> Value {
 /// 配额配置表单。用户可像普通插件一样改脚本/停用/删除——已播过种的库不再重播
 /// （settings 标记 [`moonbridge_store::QUOTA_SEEDS_DONE`]），用户删掉的内置插件不会复活。
 pub const BUILTIN_QUOTA_PLUGINS: &[(&str, &str)] = &[
-    ("new-api", include_str!("../../../plugins/quota/new-api.lua")),
-    ("sub2api", include_str!("../../../plugins/quota/sub2api.lua")),
-    ("deepseek", include_str!("../../../plugins/quota/deepseek.lua")),
-    ("moonshot", include_str!("../../../plugins/quota/moonshot.lua")),
-    ("siliconflow", include_str!("../../../plugins/quota/siliconflow.lua")),
-    ("openrouter", include_str!("../../../plugins/quota/openrouter.lua")),
-    ("zhipu-glm", include_str!("../../../plugins/quota/zhipu-glm.lua")),
-    ("kimi-coding", include_str!("../../../plugins/quota/kimi-coding.lua")),
-    ("commandcode", include_str!("../../../plugins/quota/commandcode.lua")),
-    ("claude-code", include_str!("../../../plugins/quota/claude-code.lua")),
-    ("generic-percent", include_str!("../../../plugins/quota/generic-percent.lua")),
-    ("generic-amount", include_str!("../../../plugins/quota/generic-amount.lua")),
+    (
+        "new-api",
+        include_str!("../../../plugins/quota/new-api.lua"),
+    ),
+    (
+        "sub2api",
+        include_str!("../../../plugins/quota/sub2api.lua"),
+    ),
+    (
+        "deepseek",
+        include_str!("../../../plugins/quota/deepseek.lua"),
+    ),
+    (
+        "moonshot",
+        include_str!("../../../plugins/quota/moonshot.lua"),
+    ),
+    (
+        "siliconflow",
+        include_str!("../../../plugins/quota/siliconflow.lua"),
+    ),
+    (
+        "openrouter",
+        include_str!("../../../plugins/quota/openrouter.lua"),
+    ),
+    (
+        "zhipu-glm",
+        include_str!("../../../plugins/quota/zhipu-glm.lua"),
+    ),
+    (
+        "kimi-coding",
+        include_str!("../../../plugins/quota/kimi-coding.lua"),
+    ),
+    (
+        "commandcode",
+        include_str!("../../../plugins/quota/commandcode.lua"),
+    ),
+    (
+        "claude-code",
+        include_str!("../../../plugins/quota/claude-code.lua"),
+    ),
+    (
+        "generic-percent",
+        include_str!("../../../plugins/quota/generic-percent.lua"),
+    ),
+    (
+        "generic-amount",
+        include_str!("../../../plugins/quota/generic-amount.lua"),
+    ),
 ];
 
 /// 首次启动播种内置配额插件；已播过种的库直接跳过（返回 Ok(false)）。
@@ -671,9 +711,8 @@ mod db_failure_tests {
         ));
         std::fs::create_dir(&directory).unwrap();
         let directory = DatabaseDirectory(directory);
-        let db =
-            Database::open_with_key(directory.0.join("quota.sqlite"), Box::new(PlaintextKey))
-                .unwrap();
+        let db = Database::open_with_key(directory.0.join("quota.sqlite"), Box::new(PlaintextKey))
+            .unwrap();
         db.upsert_plugin(&PluginRecord {
             name: "quota-script".into(),
             source: "lua".into(),
@@ -735,10 +774,7 @@ mod db_failure_tests {
         let engine = QuotaEngine::new(db.clone(), None);
         assert_query_succeeds(&engine, &provider).await;
         directory.execute("DROP TABLE providers;");
-        assert_sqlite_error(
-            db.list_providers().unwrap_err(),
-            "no such table: providers",
-        );
+        assert_sqlite_error(db.list_providers().unwrap_err(), "no such table: providers");
 
         assert_sqlite_error(
             engine.refresh_all().await.unwrap_err(),
