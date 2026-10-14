@@ -305,12 +305,17 @@ impl ClientStreamAdapter for AnthropicAdapter {
                 ));
             }
             CoreStreamEvent::BlockStart { index, block } => {
-                // 推理块不开：等首个 delta 到达再惰性开启（见 fn 文档）
+                // 推理块不开：等首个 delta 到达再惰性开启（见 fn 文档）；
+                // 仍记下起始块——内容只在收尾块到达时 BlockStop 兜底整段下发。
                 if matches!(block, ContentBlock::Reasoning { .. }) {
+                    st.note_start(*index, block);
                     return Ok(out);
                 }
                 let cb = match block {
                     ContentBlock::ToolUse { id, name, .. } => {
+                        // 记下起始块：收尾时若 block=None 仍须识别 tool_use
+                        // 并补发完整 arguments（见 BlockStop 分支）。
+                        st.note_start(*index, block);
                         json!({ "type": "tool_use", "id": id, "name": name, "input": {} })
                     }
                     _ => json!({ "type": "text", "text": "" }),
@@ -324,6 +329,7 @@ impl ClientStreamAdapter for AnthropicAdapter {
             CoreStreamEvent::BlockDelta { index, delta } => {
                 match delta {
                     StreamDelta::Text { text } => {
+                        st.push_delta(*index, text);
                         // 惰性开块：chat 系上游（OpenAI Chat 等）正文只有裸
                         // BlockDelta、无 BlockStart，必须补 content_block_start，
                         // 否则客户端收到没有块头的孤立增量。上游已发过
@@ -347,6 +353,7 @@ impl ClientStreamAdapter for AnthropicAdapter {
                         ));
                     }
                     StreamDelta::ToolInput { partial_json } => {
+                        st.push_delta(*index, partial_json);
                         out.push(client_sse(
                             "content_block_delta",
                             json!({
@@ -356,6 +363,7 @@ impl ClientStreamAdapter for AnthropicAdapter {
                         ));
                     }
                     StreamDelta::Reasoning { text } => {
+                        st.push_delta(*index, text);
                         // 惰性开启：首个推理明文增量到达时才开 thinking 块
                         if st.open_blocks.insert(*index) {
                             out.push(client_sse(
@@ -404,13 +412,128 @@ impl ClientStreamAdapter for AnthropicAdapter {
                     }
                 }
             }
-            CoreStreamEvent::BlockStop { index, .. } => {
+            CoreStreamEvent::BlockStop { index, block } => {
                 // 仅对已开启的块收尾；从未开启的（空推理块）不产生任何事件
                 if st.open_blocks.remove(index) {
+                    // 工具块的 arguments 可能只在收尾完整块里到达（Responses
+                    // `arguments.done` 单帧形态）或增量帧全为空串：若本块从未
+                    // 下发过非空 input_json_delta，先补一帧携带完整 input 的
+                    // delta，再发 stop——否则客户端收到「start+stop、参数缓冲
+                    // 为空」的畸形 tool_use，严格解析器直接判 InvalidStreamError
+                    // 断开连接（qwen-code 实测行为）。Text 同理：上游把整段
+                    // 正文只放在收尾块时补发 text_delta 再收尾。
+                    let input = match block.as_ref() {
+                        Some(ContentBlock::ToolUse { input, .. }) => Some(input),
+                        _ => None,
+                    };
+                    let is_tool = input.is_some()
+                        || matches!(st.blocks.get(index), Some(ContentBlock::ToolUse { .. }));
+                    let pending_text = match block.as_ref() {
+                        Some(ContentBlock::Text { text }) if !text.is_empty() => Some(text.clone()),
+                        _ => None,
+                    };
+                    if let Some(text) = pending_text
+                        .filter(|_| st.delta_acc.get(index).is_none_or(|s| s.is_empty()))
+                    {
+                        out.push(client_sse(
+                            "content_block_delta",
+                            json!({
+                                "type": "content_block_delta", "index": index,
+                                "delta": { "type": "text_delta", "text": text }
+                            }),
+                        ));
+                    }
+                    if is_tool {
+                        let emitted = st.delta_acc.get(index).is_some_and(|s| !s.is_empty());
+                        if !emitted {
+                            let args = input
+                                .filter(|v| !v.is_null())
+                                .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".into()))
+                                .unwrap_or_else(|| "{}".to_string());
+                            out.push(client_sse(
+                                "content_block_delta",
+                                json!({
+                                    "type": "content_block_delta", "index": index,
+                                    "delta": { "type": "input_json_delta", "partial_json": args }
+                                }),
+                            ));
+                        }
+                    }
                     out.push(client_sse(
                         "content_block_stop",
                         json!({ "type": "content_block_stop", "index": index }),
                     ));
+                } else {
+                    // 推理块惰性开启、内容只在收尾块里到达（上游不走明文增量）
+                    // 时从未开过——把完整思考连开带收一次下发，否则静默丢失。
+                    let thinking = match block.as_ref().or_else(|| st.blocks.get(index)) {
+                        Some(ContentBlock::Reasoning {
+                            text,
+                            signature,
+                            redacted,
+                        }) => Some((text.clone(), signature.clone(), *redacted)),
+                        _ => None,
+                    };
+                    if let Some((text, signature, redacted)) = thinking {
+                        // 纯空块（无文本无凭据）不产出任何事件
+                        if text.is_empty() && signature.is_none() {
+                            return Ok(out);
+                        }
+                        if redacted {
+                            let data = signature
+                                .as_deref()
+                                .map(|s| {
+                                    crate::adapters::emit_signature(
+                                        crate::adapters::SIG_ANTHROPIC,
+                                        s,
+                                    )
+                                })
+                                .unwrap_or_default();
+                            out.push(client_sse(
+                                "content_block_start",
+                                json!({
+                                    "type": "content_block_start", "index": index,
+                                    "content_block": { "type": "redacted_thinking", "data": data }
+                                }),
+                            ));
+                        } else {
+                            out.push(client_sse(
+                                "content_block_start",
+                                json!({
+                                    "type": "content_block_start", "index": index,
+                                    "content_block": { "type": "thinking", "thinking": "" }
+                                }),
+                            ));
+                            if !text.is_empty() {
+                                out.push(client_sse(
+                                    "content_block_delta",
+                                    json!({
+                                        "type": "content_block_delta", "index": index,
+                                        "delta": { "type": "thinking_delta", "thinking": text }
+                                    }),
+                                ));
+                            }
+                            if let Some(sig) = signature.as_deref() {
+                                let enc = crate::adapters::emit_signature(
+                                    crate::adapters::SIG_ANTHROPIC,
+                                    sig,
+                                );
+                                if !enc.is_empty() {
+                                    out.push(client_sse(
+                                        "content_block_delta",
+                                        json!({
+                                            "type": "content_block_delta", "index": index,
+                                            "delta": { "type": "signature_delta", "signature": enc }
+                                        }),
+                                    ));
+                                }
+                            }
+                        }
+                        out.push(client_sse(
+                            "content_block_stop",
+                            json!({ "type": "content_block_stop", "index": index }),
+                        ));
+                    }
                 }
             }
             CoreStreamEvent::MessageDelta { stop_reason, usage } => {
@@ -656,5 +779,148 @@ mod tests {
             )
             .unwrap();
         assert!(evs.is_empty());
+    }
+
+    /// 回归（qwen-code InvalidStreamError）：工具块的 arguments 只在收尾完整块
+    /// 里到达时，encode 必须在 content_block_stop 前补发携带完整 input 的
+    /// input_json_delta——否则下游收到「start+stop、参数缓冲为空」的畸形
+    /// tool_use，严格客户端直接断连（实测 error_type=InvalidStreamError）。
+    #[test]
+    fn encodes_stop_with_args_when_no_input_delta() {
+        use moonbridge_core::ContentBlock;
+        let adapter = AnthropicAdapter;
+        let ctx = ReqCtx::new("r1", Protocol::OpenAiResponse);
+        let mut st = StreamEncodeState::default();
+        let block = ContentBlock::ToolUse {
+            id: "call_1".into(),
+            item_id: None,
+            name: "list_directory".into(),
+            namespace: None,
+            input: json!({"path": "/tmp"}),
+            signature: None,
+        };
+        let evs = adapter
+            .encode(
+                &ctx,
+                &CoreStreamEvent::BlockStart {
+                    index: 0,
+                    block: block.clone(),
+                },
+                &mut st,
+            )
+            .unwrap();
+        assert_eq!(evs.len(), 1, "BlockStart 应只产 content_block_start");
+
+        let evs = adapter
+            .encode(
+                &ctx,
+                &CoreStreamEvent::BlockStop {
+                    index: 0,
+                    block: Some(block),
+                },
+                &mut st,
+            )
+            .unwrap();
+        assert_eq!(
+            evs.len(),
+            2,
+            "缺参数增量的 tool_use 收尾应补 delta + stop: {evs:?}"
+        );
+        let d = evs[0].data.as_json().unwrap();
+        assert_eq!(d["type"], "content_block_delta");
+        assert_eq!(d["delta"]["type"], "input_json_delta");
+        assert_eq!(d["delta"]["partial_json"], r#"{"path":"/tmp"}"#);
+        assert_eq!(evs[1].data.as_json().unwrap()["type"], "content_block_stop");
+    }
+
+    /// 同上但上游真·空参（无 block / input 为 null）：也要补 "{}" 而非发空缓冲。
+    #[test]
+    fn encodes_stop_with_empty_args_fallback() {
+        use moonbridge_core::ContentBlock;
+        let adapter = AnthropicAdapter;
+        let ctx = ReqCtx::new("r1", Protocol::OpenAiResponse);
+        let mut st = StreamEncodeState::default();
+        let block = ContentBlock::ToolUse {
+            id: "call_2".into(),
+            item_id: None,
+            name: "get_time".into(),
+            namespace: None,
+            input: Value::Null,
+            signature: None,
+        };
+        adapter
+            .encode(
+                &ctx,
+                &CoreStreamEvent::BlockStart { index: 0, block },
+                &mut st,
+            )
+            .unwrap();
+        let evs = adapter
+            .encode(
+                &ctx,
+                &CoreStreamEvent::BlockStop {
+                    index: 0,
+                    block: None,
+                },
+                &mut st,
+            )
+            .unwrap();
+        assert_eq!(
+            evs.len(),
+            2,
+            "block=None 的 tool_use 收尾也应补 delta: {evs:?}"
+        );
+        assert_eq!(
+            evs[0].data.as_json().unwrap()["delta"]["partial_json"],
+            "{}"
+        );
+    }
+
+    /// 已有非空参数增量时不应重复补发。
+    #[test]
+    fn no_duplicate_args_when_delta_streamed() {
+        use moonbridge_core::ContentBlock;
+        let adapter = AnthropicAdapter;
+        let ctx = ReqCtx::new("r1", Protocol::OpenAiResponse);
+        let mut st = StreamEncodeState::default();
+        let block = ContentBlock::ToolUse {
+            id: "call_3".into(),
+            item_id: None,
+            name: "read_file".into(),
+            namespace: None,
+            input: Value::Null,
+            signature: None,
+        };
+        adapter
+            .encode(
+                &ctx,
+                &CoreStreamEvent::BlockStart { index: 0, block },
+                &mut st,
+            )
+            .unwrap();
+        adapter
+            .encode(
+                &ctx,
+                &CoreStreamEvent::BlockDelta {
+                    index: 0,
+                    delta: StreamDelta::ToolInput {
+                        partial_json: r#"{"a":1}"#.into(),
+                    },
+                },
+                &mut st,
+            )
+            .unwrap();
+        let evs = adapter
+            .encode(
+                &ctx,
+                &CoreStreamEvent::BlockStop {
+                    index: 0,
+                    block: None,
+                },
+                &mut st,
+            )
+            .unwrap();
+        assert_eq!(evs.len(), 1, "已下发参数增量的块收尾只应有 stop: {evs:?}");
+        assert_eq!(evs[0].data.as_json().unwrap()["type"], "content_block_stop");
     }
 }

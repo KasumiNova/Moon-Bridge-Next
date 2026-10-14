@@ -632,6 +632,40 @@ impl ProviderStreamAdapter for OpenAiResponsesAdapter {
                     .to_string();
                 out.push(CoreStreamEvent::Error { message });
             }
+            // 独立的 `error` 事件帧：new-api 类中转在 response.failed 之前先发它，
+            // 携带真实失败原因（rate_limit_error/turn_rate_limit_exceeded + Retry-After），
+            // 比 response.failed 的通用包装（"Upstream request failed"）信息量大。
+            // 消息合成 `code: message`，code 留给插件 match 与日志分辨。
+            "error" => {
+                let code = data
+                    .get("error")
+                    .and_then(|e| e.get("code"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let message = data
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if !message.is_empty() {
+                    let mut text = if code.is_empty() {
+                        message.to_string()
+                    } else {
+                        format!("{code}: {message}")
+                    };
+                    // 限流类错误把上游建议的等待时长带出来（`[retry-after=Ns]`），
+                    // 插件据此排定重试延迟——固定退避对容量窗口毫无意义。
+                    if let Some(ra) = data
+                        .get("headers")
+                        .and_then(|h| h.get("Retry-After"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        text = format!("{text} [retry-after={ra}s]");
+                    }
+                    out.push(CoreStreamEvent::Error { message: text });
+                }
+            }
             _ => {}
         }
         Ok(out)
@@ -1000,8 +1034,75 @@ mod tests {
         let output = completed["response"]["output"].as_array().unwrap();
         assert_eq!(output.len(), 2);
         assert_eq!(output[0]["type"], "reasoning");
-        assert_eq!(output[0]["encrypted_content"], "ENC", "本家凭据出站解除标记");
+        assert_eq!(
+            output[0]["encrypted_content"], "ENC",
+            "本家凭据出站解除标记"
+        );
         assert_eq!(output[1]["type"], "message");
         assert_eq!(output[1]["content"][0]["text"], "Hi");
+    }
+
+    /// 回归（cctq/new-api 实测）：独立 `error` 事件帧携带真实失败原因
+    /// （rate_limit_error/turn_rate_limit_exceeded + Retry-After），须透出为
+    /// Core Error 事件而非丢弃——code 与 retry-after 一并进入消息文本。
+    #[test]
+    fn decodes_inband_error_event_with_retry_after() {
+        let adapter = OpenAiResponsesAdapter;
+        let ctx = ReqCtx::new("r1", Protocol::OpenAiResponse);
+        let mut st = StreamDecodeState::default();
+        let evs = adapter
+            .decode(
+                &ctx,
+                &mut st,
+                &chunk(json!({
+                    "type": "error",
+                    "status": 429,
+                    "headers": {"Retry-After": "53"},
+                    "error": {
+                        "type": "rate_limit_error",
+                        "code": "turn_rate_limit_exceeded",
+                        "message": "Codex is at capacity, please try again later"
+                    }
+                })),
+            )
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            CoreStreamEvent::Error { message } => {
+                assert_eq!(
+                    message,
+                    "turn_rate_limit_exceeded: Codex is at capacity, please try again later [retry-after=53s]"
+                );
+            }
+            _ => panic!("expected error event: {evs:?}"),
+        }
+    }
+
+    /// error 帧缺 code 时只透出 message；无 message 时不产事件。
+    #[test]
+    fn decodes_inband_error_minimal() {
+        let adapter = OpenAiResponsesAdapter;
+        let ctx = ReqCtx::new("r1", Protocol::OpenAiResponse);
+        let mut st = StreamDecodeState::default();
+        let evs = adapter
+            .decode(
+                &ctx,
+                &mut st,
+                &chunk(json!({"type": "error", "error": {"message": "boom"}})),
+            )
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            CoreStreamEvent::Error { message } => assert_eq!(message, "boom"),
+            _ => panic!("expected error event: {evs:?}"),
+        }
+        let evs = adapter
+            .decode(
+                &ctx,
+                &mut st,
+                &chunk(json!({"type": "error", "error": {"code": "x"}})),
+            )
+            .unwrap();
+        assert!(evs.is_empty(), "无 message 的 error 帧不产事件: {evs:?}");
     }
 }

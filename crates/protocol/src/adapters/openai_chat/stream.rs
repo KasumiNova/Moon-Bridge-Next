@@ -123,6 +123,7 @@ impl ClientStreamAdapter for OpenAiChatAdapter {
                 }
                 // 双写两种生态约定：DeepSeek（reasoning_content）与 OpenRouter/vLLM（reasoning）
                 StreamDelta::Reasoning { text } => {
+                    st.push_delta(*index, text);
                     out.push(chat_chunk(
                         st,
                         ctx,
@@ -142,7 +143,51 @@ impl ClientStreamAdapter for OpenAiChatAdapter {
                     ));
                 }
             },
-            CoreStreamEvent::BlockStop { .. } => {}
+            CoreStreamEvent::BlockStop { index, block } => {
+                // 工具块的 arguments 可能只在收尾完整块里到达（Responses 上游
+                // `arguments.done` 单帧形态）：若本块从未下发过非空 arguments
+                // 增量，补发一帧携带完整 input 的 arguments delta——否则客户端
+                // 收到 `arguments: ""` 的空参数工具调用（参数静默丢失）。
+                let input = match block.as_ref() {
+                    Some(ContentBlock::ToolUse { input, .. }) => Some(input),
+                    _ => None,
+                };
+                let is_tool = input.is_some()
+                    || matches!(st.blocks.get(index), Some(ContentBlock::ToolUse { .. }));
+                if is_tool {
+                    let emitted = st.delta_acc.get(index).is_some_and(|s| !s.is_empty());
+                    if !emitted {
+                        let args = input
+                            .filter(|v| !v.is_null())
+                            .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".into()))
+                            .unwrap_or_else(|| "{}".to_string());
+                        let ord = st.tool_ordinal(*index);
+                        out.push(tool_chunk(
+                            st,
+                            ctx,
+                            json!({ "index": ord, "function": { "arguments": args } }),
+                        ));
+                    }
+                    return Ok(out);
+                }
+                // Text/Reasoning 同理：整段内容只在收尾块到达时补发对应增量。
+                let text_field = match block.as_ref() {
+                    Some(ContentBlock::Text { text }) => Some(("content", text)),
+                    Some(ContentBlock::Reasoning { text, .. }) => Some(("reasoning", text)),
+                    _ => None,
+                };
+                if let Some((field, text)) = text_field {
+                    let emitted = st.delta_acc.get(index).is_some_and(|s| !s.is_empty());
+                    if !emitted && !text.is_empty() {
+                        let delta = if field == "reasoning" {
+                            json!({ "reasoning_content": text, "reasoning": text })
+                        } else {
+                            json!({ "content": text })
+                        };
+                        out.push(chat_chunk(st, ctx, delta, Value::Null));
+                    }
+                }
+            }
             CoreStreamEvent::MessageDelta { stop_reason, usage } => {
                 if let Some(u) = usage {
                     st.merge_usage(u);
@@ -240,6 +285,23 @@ impl ProviderStreamAdapter for OpenAiChatAdapter {
         let Some(data) = chunk_json(chunk) else {
             return Ok(Vec::new());
         };
+        // 带内错误帧：`{"error":{...}}`（new-api 类中转的形态）——取 code 与
+        // message 合成错误文本，透出而非吞掉。
+        if let Some(err) = data.get("error") {
+            let code = err.get("code").and_then(|v| v.as_str()).unwrap_or_default();
+            let message = err
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if !message.is_empty() {
+                let text = if code.is_empty() {
+                    message.to_string()
+                } else {
+                    format!("{code}: {message}")
+                };
+                return Ok(vec![CoreStreamEvent::Error { message: text }]);
+            }
+        }
         let mut out = Vec::new();
         let choice = data
             .get("choices")
@@ -779,5 +841,93 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    /// 回归：工具 arguments 只在收尾完整块里到达（上游不发增量帧）时，
+    /// BlockStop 必须补发携带完整 input 的 arguments delta——否则下游拿到
+    /// `arguments: ""` 的空参数调用，参数静默丢失。
+    #[test]
+    fn encodes_stop_with_args_when_no_input_delta() {
+        let adapter = OpenAiChatAdapter;
+        let ctx = ReqCtx::new("r1", Protocol::OpenAiChat);
+        let mut st = StreamEncodeState::default();
+        let block = ContentBlock::ToolUse {
+            id: "call_1".into(),
+            item_id: None,
+            name: "read_file".into(),
+            namespace: None,
+            input: json!({"path": "/tmp/x"}),
+            signature: None,
+        };
+        adapter
+            .encode(
+                &ctx,
+                &CoreStreamEvent::BlockStart {
+                    index: 0,
+                    block: block.clone(),
+                },
+                &mut st,
+            )
+            .unwrap();
+        let evs = adapter
+            .encode(
+                &ctx,
+                &CoreStreamEvent::BlockStop {
+                    index: 0,
+                    block: Some(block),
+                },
+                &mut st,
+            )
+            .unwrap();
+        assert_eq!(evs.len(), 1, "应补发一帧 arguments delta: {evs:?}");
+        let tc = &evs[0].data.as_json().unwrap()["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(tc["index"], 0);
+        assert_eq!(tc["function"]["arguments"], r#"{"path":"/tmp/x"}"#);
+    }
+
+    /// 已有非空参数增量时 BlockStop 不再补发。
+    #[test]
+    fn no_args_chunk_when_delta_streamed() {
+        let adapter = OpenAiChatAdapter;
+        let ctx = ReqCtx::new("r1", Protocol::OpenAiChat);
+        let mut st = StreamEncodeState::default();
+        let block = ContentBlock::ToolUse {
+            id: "call_2".into(),
+            item_id: None,
+            name: "read_file".into(),
+            namespace: None,
+            input: Value::Null,
+            signature: None,
+        };
+        adapter
+            .encode(
+                &ctx,
+                &CoreStreamEvent::BlockStart { index: 0, block },
+                &mut st,
+            )
+            .unwrap();
+        adapter
+            .encode(
+                &ctx,
+                &CoreStreamEvent::BlockDelta {
+                    index: 0,
+                    delta: StreamDelta::ToolInput {
+                        partial_json: r#"{"a":1}"#.into(),
+                    },
+                },
+                &mut st,
+            )
+            .unwrap();
+        let evs = adapter
+            .encode(
+                &ctx,
+                &CoreStreamEvent::BlockStop {
+                    index: 0,
+                    block: None,
+                },
+                &mut st,
+            )
+            .unwrap();
+        assert!(evs.is_empty(), "已下发参数增量时收尾应静默: {evs:?}");
     }
 }

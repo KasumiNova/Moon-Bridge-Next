@@ -359,15 +359,70 @@ impl ClientStreamAdapter for GoogleGenAiAdapter {
         let mut out = Vec::new();
         match ev {
             CoreStreamEvent::MessageStart { .. } => {}
-            CoreStreamEvent::BlockStart { block, .. } => {
-                if let ContentBlock::ToolUse {
-                    name,
-                    input,
-                    signature,
-                    ..
-                } = block
-                {
-                    let mut fc = json!({ "name": name, "args": input });
+            CoreStreamEvent::BlockStart { index, block } => {
+                if let ContentBlock::ToolUse { .. } = block {
+                    // 记下起始块：functionCall 的 args/thoughtSignature 可能只在
+                    // 收尾完整块里到达（见 BlockStop 分支），此处暂不下发。
+                    st.note_start(*index, block);
+                }
+            }
+            CoreStreamEvent::BlockDelta { index, delta } => match delta {
+                StreamDelta::Text { text } => {
+                    if !text.is_empty() {
+                        st.push_delta(*index, text);
+                        out.push(gemini_chunk(json!([{ "text": text }]), None, None));
+                    }
+                }
+                StreamDelta::Reasoning { text } => {
+                    if !text.is_empty() {
+                        st.push_delta(*index, text);
+                        out.push(gemini_chunk(json!([{ "text": text }]), None, None));
+                    }
+                }
+                // Gemini 流式无凭据承载位（thoughtSignature 是非流式 part 级字段）
+                StreamDelta::ReasoningSignature { .. } => {}
+                // 参数增量先累积——Gemini 的 functionCall args 不可跨 chunk 切分，
+                // 只能随 BlockStop 一次性下发（见下）。
+                StreamDelta::ToolInput { partial_json } => {
+                    st.push_delta(*index, partial_json);
+                }
+            },
+            CoreStreamEvent::BlockStop { index, block } => {
+                // functionCall 是原子 part，等到收尾拿到完整 args 再一次性下发。
+                // args 取法：收尾块 input > 累积增量拼合 > 起始块 input > 空对象——
+                // 上游把参数只放在 arguments.done 类收尾帧时，起始块 input 是
+                // 空壳，若在 BlockStart 就发会把真实参数整份丢掉。
+                let tool = match block.as_ref() {
+                    Some(ContentBlock::ToolUse { .. }) => block.as_ref(),
+                    _ => st.blocks.get(index),
+                };
+                if let Some(ContentBlock::ToolUse { name, input, .. }) = tool {
+                    let signature = match tool {
+                        Some(ContentBlock::ToolUse {
+                            signature: Some(s), ..
+                        }) => Some(s.clone()),
+                        _ => match st.blocks.get(index) {
+                            Some(ContentBlock::ToolUse { signature, .. }) => signature.clone(),
+                            _ => None,
+                        },
+                    };
+                    let acc_args = st
+                        .delta_acc
+                        .get(index)
+                        .filter(|s| !s.is_empty())
+                        .and_then(|s| serde_json::from_str::<Value>(s).ok());
+                    let start_input = match st.blocks.get(index) {
+                        Some(ContentBlock::ToolUse { input: i, .. }) if !i.is_null() => {
+                            Some(i.clone())
+                        }
+                        _ => None,
+                    };
+                    let args = if !input.is_null() {
+                        input.clone()
+                    } else {
+                        acc_args.or(start_input).unwrap_or_else(|| json!({}))
+                    };
+                    let mut fc = json!({ "name": name, "args": args });
                     if let Some(sig) = crate::adapters::untag_signature(
                         crate::adapters::SIG_GEMINI,
                         signature.as_deref(),
@@ -377,24 +432,18 @@ impl ClientStreamAdapter for GoogleGenAiAdapter {
                         }
                     }
                     out.push(gemini_chunk(json!([{ "functionCall": fc }]), None, None));
+                    return Ok(out);
+                }
+                // Text/Reasoning 同理：整段只在收尾块到达时补发 text part。
+                let text = match block.as_ref().or_else(|| st.blocks.get(index)) {
+                    Some(ContentBlock::Text { text })
+                    | Some(ContentBlock::Reasoning { text, .. }) => text.clone(),
+                    _ => String::new(),
+                };
+                if !text.is_empty() && st.delta_acc.get(index).is_none_or(|s| s.is_empty()) {
+                    out.push(gemini_chunk(json!([{ "text": text }]), None, None));
                 }
             }
-            CoreStreamEvent::BlockDelta { delta, .. } => match delta {
-                StreamDelta::Text { text } => {
-                    if !text.is_empty() {
-                        out.push(gemini_chunk(json!([{ "text": text }]), None, None));
-                    }
-                }
-                StreamDelta::Reasoning { text } => {
-                    if !text.is_empty() {
-                        out.push(gemini_chunk(json!([{ "text": text }]), None, None));
-                    }
-                }
-                // Gemini 流式无凭据承载位（thoughtSignature 是非流式 part 级字段）
-                StreamDelta::ReasoningSignature { .. } => {}
-                StreamDelta::ToolInput { .. } => {}
-            },
-            CoreStreamEvent::BlockStop { .. } => {}
             CoreStreamEvent::MessageDelta { stop_reason, usage } => {
                 if let Some(u) = usage {
                     st.merge_usage(u);
@@ -744,5 +793,116 @@ mod tests {
             )
             .unwrap()
             .is_empty());
+    }
+
+    /// 回归：functionCall 推迟到 BlockStop 一次性下发——上游把 args 只放在
+    /// 收尾完整块里时（起始块 input 为空），必须以收尾块的完整 input 发出，
+    /// 否则 functionCall 带着空 args 提前飞走、真实参数整份丢失。
+    #[test]
+    fn function_call_emitted_at_stop_with_complete_args() {
+        use moonbridge_core::ContentBlock;
+        let adapter = GoogleGenAiAdapter;
+        let ctx = ReqCtx::new("r1", Protocol::GoogleGenai);
+        let mut st = StreamEncodeState::default();
+        let start_block = ContentBlock::ToolUse {
+            id: "call_1".into(),
+            item_id: None,
+            name: "read_file".into(),
+            namespace: None,
+            input: Value::Null, // 上游起始块未带参数
+            signature: None,
+        };
+        let evs = adapter
+            .encode(
+                &ctx,
+                &CoreStreamEvent::BlockStart {
+                    index: 0,
+                    block: start_block,
+                },
+                &mut st,
+            )
+            .unwrap();
+        assert!(
+            evs.is_empty(),
+            "BlockStart 不应提前发 functionCall: {evs:?}"
+        );
+
+        let evs = adapter
+            .encode(
+                &ctx,
+                &CoreStreamEvent::BlockStop {
+                    index: 0,
+                    block: Some(ContentBlock::ToolUse {
+                        id: "call_1".into(),
+                        item_id: None,
+                        name: "read_file".into(),
+                        namespace: None,
+                        input: json!({"path": "/tmp/x"}),
+                        signature: None,
+                    }),
+                },
+                &mut st,
+            )
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+        let fc =
+            &evs[0].data.as_json().unwrap()["candidates"][0]["content"]["parts"][0]["functionCall"];
+        assert_eq!(fc["name"], "read_file");
+        assert_eq!(fc["args"]["path"], "/tmp/x");
+    }
+
+    /// 参数经增量流到达（block=None）时，收尾应从累积增量还原 args。
+    #[test]
+    fn function_call_args_from_delta_acc() {
+        use moonbridge_core::ContentBlock;
+        let adapter = GoogleGenAiAdapter;
+        let ctx = ReqCtx::new("r1", Protocol::GoogleGenai);
+        let mut st = StreamEncodeState::default();
+        adapter
+            .encode(
+                &ctx,
+                &CoreStreamEvent::BlockStart {
+                    index: 0,
+                    block: ContentBlock::ToolUse {
+                        id: "call_2".into(),
+                        item_id: None,
+                        name: "write_file".into(),
+                        namespace: None,
+                        input: Value::Null,
+                        signature: None,
+                    },
+                },
+                &mut st,
+            )
+            .unwrap();
+        for pj in [r#"{"path":"#, r#""/a""#, r#","c":"b"}"#] {
+            adapter
+                .encode(
+                    &ctx,
+                    &CoreStreamEvent::BlockDelta {
+                        index: 0,
+                        delta: StreamDelta::ToolInput {
+                            partial_json: pj.into(),
+                        },
+                    },
+                    &mut st,
+                )
+                .unwrap();
+        }
+        let evs = adapter
+            .encode(
+                &ctx,
+                &CoreStreamEvent::BlockStop {
+                    index: 0,
+                    block: None,
+                },
+                &mut st,
+            )
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+        let fc =
+            &evs[0].data.as_json().unwrap()["candidates"][0]["content"]["parts"][0]["functionCall"];
+        assert_eq!(fc["args"]["path"], "/a");
+        assert_eq!(fc["args"]["c"], "b");
     }
 }
