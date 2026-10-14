@@ -1,0 +1,85 @@
+# Maintainer: Moon Bridge Next Contributors
+pkgname=moon-bridge-next
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="本地 LLM 网关：多协议入口、Core IR 居中转换、Lua 插件、用量统计"
+arch=('x86_64' 'aarch64')
+url="https://github.com/ZhiYi-R/Moon-Bridge-Next"
+license=('GPL-3.0-or-later')
+depends=(
+  'webkit2gtk-4.1'
+  'gtk3'
+  'libayatana-appindicator'
+  'librsvg'
+)
+makedepends=(
+  'rust'
+  'nodejs'
+  'pnpm'
+  'git'
+  'jq'
+)
+# tauri-plugin-opener 在 Linux 下经 xdg-open 打开外部链接/目录
+optdepends=('xdg-utils: 打开外部链接与目录')
+# 关闭 makepkg 的 LTO 注入：Rust 侧由 workspace profile（thin LTO）控制，
+# mlua vendored Lua / rusqlite bundled SQLite 的 C 代码叠加 -flto 易出问题
+options=('!lto')
+# 源码包由构建方生成（CI: git archive tag；本地: git archive HEAD），
+# 顶层目录固定为 ${pkgname}-${pkgver}：生成时的 --prefix 必须与注入后的
+# pkgver 一致（CI 两者同源 APP_VERSION，见 release.yml build-arch）。
+# 校验值构建前注入。
+source=("${pkgname}-${pkgver}.tar.gz")
+sha256sums=('TARBALL_SHA256_PLACEHOLDER')
+
+prepare() {
+  cd "${pkgname}-${pkgver}"
+  # 版本号以 pkgver（Release tag）为准写回三处，与 build job 的 sed 口径一致：
+  # 包内二进制自报版本须与同一次 release 的 deb/rpm/AppImage 相同。
+  # 仓库内版本与 pkgver 相同（本地构建）时以下改写为同值覆盖。
+  sed -i '/^\[workspace\.package\]/,/^\[/s/^version = ".*"/version = "'"${pkgver}"'"/' Cargo.toml
+  sed -i 's/"version": ".*"/"version": "'"${pkgver}"'"/' src-tauri/tauri.conf.json ui/package.json
+}
+
+build() {
+  cd "${pkgname}-${pkgver}"
+  # tauri-build 在 cargo 编译期内嵌 frontendDist（ui/dist），需先构建前端
+  pnpm --dir ui install --frozen-lockfile
+  pnpm --dir ui build
+  # 不用 --locked：prepare() 改写 workspace 版本后 Cargo.lock 需随成员版本
+  # 同步更新（与 build job 的 tauri build 一致，其同样不加 --locked）。
+  # custom-protocol 由 Tauri CLI 在 tauri build 时注入，是 dev/prod 的判定开关
+  # （tauri::is_dev() = !cfg!(feature = "custom-protocol")）；直接 cargo 构建
+  # 必须显式开启，否则 webview 走 devUrl（http://localhost:5173）而非内嵌资源
+  cargo build --release -p moonbridge-app --features tauri/custom-protocol
+}
+
+package() {
+  cd "${pkgname}-${pkgver}"
+  # CARGO_TARGET_DIR 可能指向源码树外的持久目录（本地迭代复用编译缓存：
+  # CARGO_TARGET_DIR=<路径> makepkg）；未设置时为 cargo 默认的 ./target
+  install -Dm755 "${CARGO_TARGET_DIR:-$PWD/target}/release/moonbridge-app" \
+    "${pkgdir}/usr/bin/moonbridge-app"
+  # desktop 条目现场生成：Name/Comment 取自 tauri.conf.json（productName /
+  # shortDescription），避免与打包元数据重复声明导致漂移
+  local app_name app_comment
+  app_name="$(jq -r '.productName' src-tauri/tauri.conf.json)"
+  app_comment="$(jq -r '.bundle.shortDescription' src-tauri/tauri.conf.json)"
+  install -Dm644 /dev/stdin "${pkgdir}/usr/share/applications/${pkgname}.desktop" <<EOF
+[Desktop Entry]
+Name=${app_name}
+Comment=${app_comment}
+Exec=moonbridge-app
+Icon=${pkgname}
+Terminal=false
+Type=Application
+Categories=Development;
+StartupWMClass=moonbridge-app
+EOF
+  install -Dm644 src-tauri/icons/32x32.png \
+    "${pkgdir}/usr/share/icons/hicolor/32x32/apps/${pkgname}.png"
+  install -Dm644 src-tauri/icons/128x128.png \
+    "${pkgdir}/usr/share/icons/hicolor/128x128/apps/${pkgname}.png"
+  install -Dm644 src-tauri/icons/128x128@2x.png \
+    "${pkgdir}/usr/share/icons/hicolor/256x256/apps/${pkgname}.png"
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

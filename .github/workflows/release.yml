@@ -171,10 +171,86 @@ jobs:
           path: release-assets/*
           if-no-files-found: error
 
+  # ── Linux pacman：Tauri v2 已移除 pacman bundle，改用 PKGBUILD 源码构建 ──
+  build-arch:
+    name: Build linux-x86_64 (pacman)
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      # checkout 需要 git；base-devel/sudo 供 makepkg 与非 root 构建用户使用
+      - name: Install base tooling
+        run: |
+          # 容器镜像可能过期：先刷新 keyring 再升级，避免签名校验失败
+          pacman -Sy --noconfirm archlinux-keyring
+          pacman -Syu --noconfirm --needed git base-devel sudo
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 与 build job 同一口径：Release tag → tag 去前缀；分支 → 仓库内版本
+      - name: Derive app version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            APP_VERSION="${GITHUB_REF_NAME#Release}"; APP_VERSION="${APP_VERSION#[/-]}"
+            IFS=. read -r a b c <<< "$APP_VERSION"
+            APP_VERSION="${a}.${b:-0}.${c:-0}"
+          else
+            APP_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          fi
+          echo "app version: $APP_VERSION"
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+
+      # PKGBUILD 源码包：从当前 checkout（tag 构建时 HEAD 即 tag）归档，
+      # 顶层目录固定为 moon-bridge-next-<pkgver>/，与 PKGBUILD 中的 cd 一致
+      - name: Create source tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          git archive --format=tar.gz \
+            --prefix="moon-bridge-next-${APP_VERSION}/" \
+            -o "deploy/arch/moon-bridge-next-${APP_VERSION}.tar.gz" HEAD
+
+      - name: Inject pkgver and tarball checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd deploy/arch
+          sed -i 's/^pkgver=.*/pkgver='"${APP_VERSION}"'/' PKGBUILD
+          sum="$(sha256sum "moon-bridge-next-${APP_VERSION}.tar.gz" | cut -d' ' -f1)"
+          sed -i "s/TARBALL_SHA256_PLACEHOLDER/${sum}/" PKGBUILD
+
+      # makepkg 拒绝 root：建 NOPASSWD 构建用户，-s 经 pacman 补齐 makedepends
+      - name: Build pacman package
+        shell: bash
+        run: |
+          set -euo pipefail
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          cd deploy/arch
+          sudo -u builder env HOME=/home/builder makepkg -s --noconfirm
+
+      - name: Collect bundles
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cp deploy/arch/*.pkg.tar.zst release-assets/
+          ls -la release-assets
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundles-linux-x86_64-pacman
+          path: release-assets/*
+          if-no-files-found: error
+
   publish:
     name: Publish Release
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, build-arch]
     # 仅 Release tag 触发发布；分支推送只做构建验证
     if: startsWith(github.ref, 'refs/tags/Release')
     permissions:
@@ -241,6 +317,7 @@ jobs:
             echo
             echo "- **Linux x86_64**：\`*_amd64.deb\` / \`*.x86_64.rpm\` / \`*_amd64.AppImage\`"
             echo "- **Linux arm64**：\`*_arm64.deb\` / \`*.aarch64.rpm\` / \`*_aarch64.AppImage\`"
+            echo "- **Arch Linux**：\`moon-bridge-next-*-x86_64.pkg.tar.zst\`（\`sudo pacman -U\` 安装）"
             echo "- **macOS**：\`*_aarch64.dmg\`（Apple Silicon）/ \`*_x64.dmg\`（Intel）"
             echo "- **Windows**：\`*_x64-setup.exe\` / \`*_arm64-setup.exe\`（NSIS 安装包，简体中文）"
             echo
