@@ -11,10 +11,16 @@ use serde_json::Value;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RawBody {
-    Json { value: Value },
-    Text { text: String },
+    Json {
+        value: Value,
+    },
+    Text {
+        text: String,
+    },
     /// 二进制体（base64 传输，Lua 侧以字符串呈现）。
-    Binary { data: Vec<u8> },
+    Binary {
+        data: Vec<u8>,
+    },
     Empty,
 }
 
@@ -180,9 +186,11 @@ pub enum RawVerdict {
         body: RawBody,
     },
     /// 重试当前上游请求：重走端点链（`from_core_request` → 出站钩子 → 发送），
-    /// `delay_ms` 毫秒后发起。仅上游响应钩子在**错误路径**（`msg.error == true`，
-    /// 上游非 2xx）上处理该动作，且是终局判定——立即生效，同阶段靠后的插件不再
-    /// 执行；其余阶段/成功路径拿到它一律按放行处理、继续扇出给后续插件。
+    /// `delay_ms` 毫秒后发起。仅上游响应钩子在**错误路径**（`msg.error == true`）上
+    /// 处理该动作，且是终局判定——立即生效，同阶段靠后的插件不再执行；其余阶段/
+    /// 成功路径拿到它一律按放行处理、继续扇出给后续插件。错误路径有两类：
+    /// 上游非 2xx；或流式请求 200 后零产出即以带内错误帧宣告失败（status=200、
+    /// error=true）——后者客户端未收到任何内容，重发安全。
     /// 网关侧有硬上限与延迟钳制（`plugin_retry_max` / `plugin_retry_delay_cap_ms`），
     /// 插件返回多少次都不会死循环。
     Retry {

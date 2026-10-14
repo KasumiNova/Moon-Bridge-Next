@@ -62,6 +62,11 @@
 ---（单端点 provider 的 5xx 自愈，见 plugins/utils/rescue_5xx.lua）。错误路径上 retry
 ---是终局判定（后续插件不再执行）；只处理错误路径的插件建议开头
 ---`if not msg.error then return end`，只处理成功的用 `if msg.error then return end`。
+---流式请求另有第二种错误路径：上游返回 200 后**尚未产出任何内容**就以带内错误帧
+---（如 responses 的 `response.failed`）宣告失败、或流未产出内容即静默终结——此时同样以
+---`msg.error == true` 触发本钩子（`status == 200`，body 为上游错误文本，见
+---plugins/utils/rescue_fake_200.lua）；零产出意味着客户端还什么都没收到，retry 是
+---安全的。一旦上游产出过内容，流不可重试、本钩子不触发。
 ---错误路径上对报文的改写不回流客户端（客户端看到的错误消息由 core 层 transform_error 决定）。
 ---@field on_upstream_response_raw (fun(ctx: MbCtx, msg: MbRawMessage): MbVerdict|nil)|nil
 ---@field on_client_response_raw (fun(ctx: MbCtx, msg: MbRawMessage): MbVerdict|nil)|nil
@@ -165,8 +170,9 @@ MB = {}
 ---@field session_id string|nil 会话身份覆写通道：仅 client_request 阶段可写生效——
 ---    改成客户端自带会话 id（如 x-opencode-session 头值）即成为最高优先级身份源；
 ---    设 nil = 否决宿主已提取身份。其他阶段回读当前已解析值，改写无效果。
----@field error boolean|nil 上游错误路径标记：仅 upstream_response 阶段在上游非 2xx 时
----    为 true（只读，插件改写无效果）；据此区分「成功响应」与「错误路径」。
+---@field error boolean|nil 上游错误路径标记：仅 upstream_response 阶段在上游非 2xx、
+---    或流式请求零产出即被上游以带内错误帧宣告失败/静默终结时为 true（此时 status=200）
+---    （只读，插件改写无效果）；据此区分「成功响应」与「错误路径」。
 
 ---@class MbRawChunk
 ---@field stage string "upstream_chunk"|"client_chunk"

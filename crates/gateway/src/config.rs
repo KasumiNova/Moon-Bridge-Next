@@ -37,6 +37,15 @@ pub struct GatewayConfig {
     /// 上游 HTTP 客户端本身只设连接超时，见 `upstream.rs::build_client`。
     #[serde(default = "default_timeout")]
     pub request_timeout_secs: u64,
+    /// 流式上游相邻两个 SSE 事件之间的空闲上限（秒）。
+    ///
+    /// 只约束「无数据间隔」，不截断持续产出的长生成。中转把连接挂起但停止
+    /// 发数据时，`chunks.next()` 会无限 pend——没有它整条流僵到客户端先断开，
+    /// 审计只能留下「客户端断开或上游提前关闭」的假象；超时则按上游错误收尾：
+    /// 向客户端发带内 error 事件 + 终结帧，usage/trace 如实记 `error`。
+    /// `0` 表示禁用（恢复无限等待的旧行为）。
+    #[serde(default = "default_stream_idle_timeout")]
+    pub stream_idle_timeout_secs: u64,
     /// trace 文件目录；`None` 表示不写入磁盘。
     #[serde(default)]
     pub trace_dir: Option<String>,
@@ -90,6 +99,9 @@ fn default_max_body() -> usize {
 fn default_timeout() -> u64 {
     300
 }
+fn default_stream_idle_timeout() -> u64 {
+    120
+}
 fn default_session_marker() -> bool {
     true
 }
@@ -118,6 +130,7 @@ impl Default for GatewayConfig {
             max_body_bytes: default_max_body(),
             plugins_dir: None,
             request_timeout_secs: default_timeout(),
+            stream_idle_timeout_secs: default_stream_idle_timeout(),
             trace_dir: None,
             trace_record_bodies: default_trace_record_bodies(),
             trace_retention: default_trace_retention(),

@@ -25,6 +25,7 @@ use crate::state::AppState;
 use crate::trace::TraceRecord;
 use crate::upstream;
 use crate::usage;
+use crate::GatewayError;
 
 /// 取客户端 chunk 应写入 `data:` 字段的文本。
 fn chunk_data_text(cc: &RawChunk) -> String {
@@ -264,6 +265,10 @@ struct StreamAudit {
     /// 客户端侧聚合：仅送入实际编码下发的事件——记录客户端实际收到的内容
     /// （含插件过滤、会话水印注入的效果，可与上游侧对比插件行为）。
     down_asm: StreamAssembler,
+    /// 最后一个上游 chunk 的到达时刻（初始化为请求起点）。aborted 时
+    /// 用它区分「上游静默超时后客户端断开」（间隔大）与「流正活跃时被掐」
+    /// （间隔≈0，客户端取消/进程退出/任务中止）。
+    last_chunk_at: Instant,
 }
 
 impl StreamAudit {
@@ -282,7 +287,27 @@ impl StreamAudit {
 
 impl Drop for StreamAudit {
     fn drop(&mut self) {
-        let (status, err) = self.outcome();
+        let (status, mut err) = self.outcome();
+        if status == "aborted" {
+            // aborted = 生成器在读流中途被 drop（下游断开或任务被杀）；距最后
+            // 上游数据的间隔是关键判别量：上游挂起后经客户端超时断开时间隔会
+            // 很大，而活跃流被掐（重启/panic/用户取消）间隔接近 0。
+            let idle_ms = self.last_chunk_at.elapsed().as_millis();
+            let msg = format!(
+                "{}；距最后上游数据 {}ms",
+                err.take().unwrap_or_default(),
+                idle_ms
+            );
+            err = Some(msg);
+            tracing::warn!(
+                request_id = %self.ctx.request_id,
+                provider = ?self.ctx.provider_key,
+                model = %self.upstream_model,
+                idle_ms = idle_ms as u64,
+                latency_ms = self.start.elapsed().as_millis() as u64,
+                "流式请求 aborted：流未读尽，生成器被 drop（客户端断开/进程退出/任务取消）"
+            );
+        }
         usage::record(
             &self.db,
             &self.ctx,
@@ -312,7 +337,174 @@ impl Drop for StreamAudit {
     }
 }
 
-/// 构建流式响应。`resp` 为已发送并收到头的上游响应。
+/// 流头窥视结果：响应已转进 chunk 流，窥视期间消费掉的 chunk 的解码事件
+/// 与 decode 状态一并移交——此时客户端还一个字节都没收到，仍可安全重发。
+pub struct StreamHead {
+    /// 剩余未消费的上游 chunk 流。
+    pub chunks: std::pin::Pin<Box<dyn futures::Stream<Item = crate::Result<RawChunk>> + Send>>,
+    /// 窥视期间产出的解码事件（前导帧），移交后须按序回放。
+    pub preamble: Vec<CoreStreamEvent>,
+    /// 窥视用掉的 decode 状态——剩余 chunk 必须沿同一状态续解。
+    pub dec_state: StreamDecodeState,
+    /// 上游响应头（窥视结束即丢失 resp，留给插件错误判定用）。
+    pub resp_headers: Vec<(String, String)>,
+    /// 窥视是否以 EOF 收尾（true = 流已完结，chunks 恒空）。
+    pub ended: bool,
+}
+
+impl StreamHead {
+    /// 未窥视的流头（无流式 Adapter 时的降级构造）：原样接管响应，
+    /// `build_stream_response` 内部走「缺少流式 Adapter」错误收尾。
+    pub fn unpeeked(resp: reqwest::Response, protocol: Protocol, provider: Option<String>) -> Self {
+        Self {
+            chunks: Box::pin(upstream::response_to_chunks(resp, protocol, provider)),
+            preamble: Vec::new(),
+            dec_state: StreamDecodeState::default(),
+            resp_headers: Vec::new(),
+            ended: false,
+        }
+    }
+}
+
+impl StreamHead {
+    /// 上游在零内容产出时宣告失败/静默终结 → 返回错误描述，整个请求可安全重发。
+    /// 只要产出过任意内容块（Block*），事件已构成客户端可见语义，不可重试。
+    pub fn retryable_failure(&self) -> Option<String> {
+        let has_content = self.preamble.iter().any(|e| {
+            matches!(
+                e,
+                CoreStreamEvent::BlockStart { .. }
+                    | CoreStreamEvent::BlockDelta { .. }
+                    | CoreStreamEvent::BlockStop { .. }
+            )
+        });
+        if has_content {
+            return None;
+        }
+        if let Some(m) = self.preamble.iter().find_map(|e| match e {
+            CoreStreamEvent::Error { message } => Some(message.clone()),
+            _ => None,
+        }) {
+            return Some(m);
+        }
+        let clean_end = self.preamble.iter().any(|e| {
+            matches!(
+                e,
+                CoreStreamEvent::MessageStop
+                    | CoreStreamEvent::MessageDelta {
+                        stop_reason: Some(_),
+                        ..
+                    }
+            )
+        });
+        if self.ended && !clean_end {
+            return Some("上游流未产出内容即结束".to_string());
+        }
+        None
+    }
+}
+
+/// 窥视窗口总时长：窥视期间客户端收不到任何字节——为等错误帧而无限等待会把
+/// 慢思考模型（首 token 可能 30s+）的首字节时间拖垮。窗口内没等到失败/内容
+/// 就照常承诺本流（前导帧回放后客户端看到的就是正常流式时序）。
+const PEEK_WINDOW_SECS: u64 = 10;
+
+/// 窥视上游流头：HTTP 200 之后、内容事件到达之前，上游仍可能以带内错误帧
+/// （`response.failed` 等）宣告失败——这种「零产出即失败」形态可安全重试，
+/// 由 dispatch 交给插件钩子定夺。逐 chunk 解码直到以下任一条件：
+/// 首个内容块事件出现（已承诺，正常接管）/ 流内错误帧 / 终帧 / EOF /
+/// 窥视窗口耗尽（照常接管）/ 出错。
+/// 返回 Err = 传输/解码失败（同样视作零产出失败，可重试）。
+pub async fn peek_upstream_head(
+    resp: reqwest::Response,
+    adapter: &dyn moonbridge_protocol::ProviderStreamAdapter,
+    ctx: &ReqCtx,
+    upstream_protocol: Protocol,
+    provider: Option<String>,
+    idle_secs: u64,
+) -> crate::Result<StreamHead> {
+    let resp_headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+    let mut chunks = Box::pin(upstream::response_to_chunks(
+        resp,
+        upstream_protocol,
+        provider,
+    ));
+    let mut dec_state = StreamDecodeState::default();
+    let mut preamble = Vec::new();
+    let mut ended = false;
+    let deadline = Instant::now() + std::time::Duration::from_secs(PEEK_WINDOW_SECS);
+    loop {
+        // 单次等待取「相邻事件空闲上限」与「窥视窗口剩余」的较小值；
+        // 窗口耗尽不算失败——照常承诺本流。
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let wait = if idle_secs > 0 {
+            remaining.min(std::time::Duration::from_secs(idle_secs))
+        } else {
+            remaining
+        };
+        let next = match tokio::time::timeout(wait, chunks.next()).await {
+            Ok(n) => n,
+            Err(_) => {
+                if wait == remaining {
+                    break; // 窗口耗尽：承诺本流
+                }
+                return Err(GatewayError::Other(format!(
+                    "上游流头等待 {idle_secs}s 无数据（疑似挂起）"
+                )));
+            }
+        };
+        let chunk = match next {
+            None => {
+                ended = true;
+                break;
+            }
+            Some(Err(e)) => return Err(e),
+            Some(Ok(c)) => c,
+        };
+        let evs = adapter
+            .decode(ctx, &mut dec_state, &chunk)
+            .map_err(|e| GatewayError::Other(format!("上游流头解码失败: {e}")))?;
+        let hit_content = evs.iter().any(|e| {
+            matches!(
+                e,
+                CoreStreamEvent::BlockStart { .. }
+                    | CoreStreamEvent::BlockDelta { .. }
+                    | CoreStreamEvent::BlockStop { .. }
+            )
+        });
+        let hit_terminal = evs.iter().any(|e| {
+            matches!(
+                e,
+                CoreStreamEvent::Error { .. }
+                    | CoreStreamEvent::MessageStop
+                    | CoreStreamEvent::MessageDelta {
+                        stop_reason: Some(_),
+                        ..
+                    }
+            )
+        });
+        preamble.extend(evs);
+        if hit_content || hit_terminal {
+            break;
+        }
+    }
+    Ok(StreamHead {
+        chunks,
+        preamble,
+        dec_state,
+        resp_headers,
+        ended,
+    })
+}
+
+/// 构建流式响应。`head` 为 `peek_upstream_head` 窥视过的上游流头。
 //
 // `audit.failed` / `audit.completed` 在本函数的生成器内写入、仅由
 // `StreamAudit::Drop` 读取。rustc 的 `unused_assignments` 只做字段级数据流分析、
@@ -323,7 +515,7 @@ impl Drop for StreamAudit {
 pub fn build_stream_response(
     state: Arc<AppState>,
     ctx: ReqCtx,
-    resp: reqwest::Response,
+    head: StreamHead,
     upstream_model: String,
     start: Instant,
     trace: TraceRecord,
@@ -331,7 +523,6 @@ pub fn build_stream_response(
 ) -> Response {
     let hooks = state.hooks.clone();
     let upstream_protocol = ctx.upstream_protocol.unwrap_or(Protocol::Anthropic);
-    let provider = ctx.provider_key.clone();
     let provider_stream = state.registry.provider_stream(upstream_protocol).cloned();
     let client_stream = state.registry.client_stream(ctx.client_protocol).cloned();
 
@@ -350,6 +541,7 @@ pub fn build_stream_response(
         completed: false,
         up_asm: StreamAssembler::default(),
         down_asm: StreamAssembler::default(),
+        last_chunk_at: start,
     };
 
     let body = async_stream::stream! {
@@ -358,7 +550,10 @@ pub fn build_stream_response(
             yield Ok::<Event, Infallible>(error_event("缺少流式 Adapter"));
             return;
         };
-        let mut chunks = Box::pin(upstream::response_to_chunks(resp, upstream_protocol, provider));
+        let mut chunks = head.chunks;
+        // 窥视期已解码出的前导事件：先于此回放，耗尽后回到上游 chunk 流。
+        let mut preamble: std::collections::VecDeque<CoreStreamEvent> =
+            head.preamble.into_iter().collect();
         // `filter_content` 丢弃的块序号：其后续增量一律压制（见下方 [CORE] 内容块过滤）。
         let mut dropped_blocks: std::collections::HashSet<usize> =
             std::collections::HashSet::new();
@@ -375,8 +570,8 @@ pub fn build_stream_response(
             std::collections::HashSet::new();
         // encode 每流状态（anthropic 入口的推理块惰性开块依赖它）
         let mut enc_state = StreamEncodeState::default();
-        // decode 每流状态（Gemini 上游的块索引跨 chunk 分配依赖它）
-        let mut dec_state = StreamDecodeState::default();
+        // decode 每流状态：窥视期已用掉一部分，沿同一状态续解剩余 chunk
+        let mut dec_state = head.dec_state;
         // 终结状态：上游协议（Chat 的 [DONE]、Gemini 的 finishReason）可能
         // 不发任何终帧就结束——客户端协议状态机需要一帧 MessageStop 作回退。
         let mut saw_stop = false;
@@ -385,69 +580,123 @@ pub fn build_stream_response(
         let mut saw_finish = false;
         let mut saw_start = false;
         // 上游带内错误帧（协议级 error event，非 decode 失败）：流被上游宣告
-        // 失败——回退收尾只补 MessageStop，不再伪造 completed 组装帧。
+        // 失败——回退收尾只补 MessageStop，不再伪造 completed 组装帧；
+        // 上游携带的错误原文存下来，审计时用它而不是笼统的「以错误帧结束」。
         let mut saw_err = false;
+        let mut upstream_err_msg: Option<String> = None;
+        // 上游是否产出过任何解码后的事件：区分「空流」与「有内容但截断」。
+        let mut saw_any = false;
+        // 相邻上游事件的空闲上限（0 = 无限等待）：中转挂起连接但停发数据时，
+        // `chunks.next()` 无限 pend 会让整条流僵到客户端先断开，审计只剩
+        // 「客户端断开」的假象；超时按上游错误收尾。
+        let idle_secs = state.config.stream_idle_timeout_secs;
 
         // 'stream 标签：解码/编码任一环节出错都要**真正终止**整条流。
         // 编码错误分支原先的 `break` 落在内层 `for ev in events` 里，只放弃了
         // 当前 chunk 的剩余事件，外层 while 继续消费上游并反复刷 error 事件。
-        'stream: while let Some(item) = chunks.next().await {
-            let mut chunk = match item {
-                Ok(c) => c,
-                Err(e) => {
-                    let msg = e.to_string();
-                    audit.failed = Some(msg.clone());
-                    // 带内错误走客户端协议的 Error 编码（而非裸 error 帧），
-                    // 并补终结帧让客户端状态机正常收尾。
-                    for cc in client_stream
-                        .encode(&ctx, &CoreStreamEvent::Error { message: msg.clone() }, &mut enc_state)
-                        .unwrap_or_default()
-                    {
-                        yield Ok(chunk_to_event(&cc));
-                    }
-                    if !saw_stop {
-                        for cc in client_stream
-                            .encode(&ctx, &CoreStreamEvent::MessageStop, &mut enc_state)
-                            .unwrap_or_default()
-                        {
-                            yield Ok(chunk_to_event(&cc));
-                        }
-                    }
-                    break 'stream;
+        'stream: loop {
+            let mut events = if let Some(ev) = preamble.pop_front() {
+                // 前导事件在窥视期就已到达——首事件时刻即 ttft
+                if audit.ttft_ms.is_none() {
+                    audit.ttft_ms = Some(start.elapsed().as_millis() as i64);
                 }
-            };
-            if audit.ttft_ms.is_none() {
-                audit.ttft_ms = Some(start.elapsed().as_millis() as i64);
-            }
-
-            // [RAW] 上游 chunk 钩子（可改写/丢弃）
-            match hooks.on_upstream_chunk_raw(&ctx, &mut chunk).await {
-                Ok(ChunkVerdict::Drop) => continue,
-                Err(e) => tracing::warn!(error = %e, "on_upstream_chunk_raw 失败，放行"),
-                Ok(ChunkVerdict::Forward) => {}
-            }
-
-            // [CORE] 解码为 Core 流事件
-            let mut events = match provider_stream.decode(&ctx, &mut dec_state, &chunk) {
-                Ok(ev) => ev,
-                Err(e) => {
-                    let msg = e.to_string();
-                    audit.failed = Some(msg.clone());
-                    for cc in client_stream
-                        .encode(&ctx, &CoreStreamEvent::Error { message: msg.clone() }, &mut enc_state)
-                        .unwrap_or_default()
+                audit.last_chunk_at = Instant::now();
+                vec![ev]
+            } else {
+                let next = if idle_secs > 0 {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(idle_secs),
+                        chunks.next(),
+                    )
+                    .await
                     {
-                        yield Ok(chunk_to_event(&cc));
+                        Ok(n) => n,
+                        Err(_) => {
+                            let msg = format!("上游流空闲 {idle_secs}s 无数据（疑似挂起）");
+                            audit.failed = Some(msg.clone());
+                            for cc in client_stream
+                                .encode(
+                                    &ctx,
+                                    &CoreStreamEvent::Error { message: msg.clone() },
+                                    &mut enc_state,
+                                )
+                                .unwrap_or_default()
+                            {
+                                yield Ok(chunk_to_event(&cc));
+                            }
+                            if !saw_stop {
+                                for cc in client_stream
+                                    .encode(&ctx, &CoreStreamEvent::MessageStop, &mut enc_state)
+                                    .unwrap_or_default()
+                                {
+                                    yield Ok(chunk_to_event(&cc));
+                                }
+                            }
+                            break 'stream;
+                        }
                     }
-                    if !saw_stop {
+                } else {
+                    chunks.next().await
+                };
+                let Some(item) = next else { break 'stream };
+                audit.last_chunk_at = Instant::now();
+                let mut chunk = match item {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        audit.failed = Some(msg.clone());
+                        // 带内错误走客户端协议的 Error 编码（而非裸 error 帧），
+                        // 并补终结帧让客户端状态机正常收尾。
                         for cc in client_stream
-                            .encode(&ctx, &CoreStreamEvent::MessageStop, &mut enc_state)
+                            .encode(&ctx, &CoreStreamEvent::Error { message: msg.clone() }, &mut enc_state)
                             .unwrap_or_default()
                         {
                             yield Ok(chunk_to_event(&cc));
                         }
+                        if !saw_stop {
+                            for cc in client_stream
+                                .encode(&ctx, &CoreStreamEvent::MessageStop, &mut enc_state)
+                                .unwrap_or_default()
+                            {
+                                yield Ok(chunk_to_event(&cc));
+                            }
+                        }
+                        break 'stream;
                     }
-                    break 'stream;
+                };
+                if audit.ttft_ms.is_none() {
+                    audit.ttft_ms = Some(start.elapsed().as_millis() as i64);
+                }
+
+                // [RAW] 上游 chunk 钩子（可改写/丢弃）
+                match hooks.on_upstream_chunk_raw(&ctx, &mut chunk).await {
+                    Ok(ChunkVerdict::Drop) => continue,
+                    Err(e) => tracing::warn!(error = %e, "on_upstream_chunk_raw 失败，放行"),
+                    Ok(ChunkVerdict::Forward) => {}
+                }
+
+                // [CORE] 解码为 Core 流事件
+                match provider_stream.decode(&ctx, &mut dec_state, &chunk) {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        audit.failed = Some(msg.clone());
+                        for cc in client_stream
+                            .encode(&ctx, &CoreStreamEvent::Error { message: msg.clone() }, &mut enc_state)
+                            .unwrap_or_default()
+                        {
+                            yield Ok(chunk_to_event(&cc));
+                        }
+                        if !saw_stop {
+                            for cc in client_stream
+                                .encode(&ctx, &CoreStreamEvent::MessageStop, &mut enc_state)
+                                .unwrap_or_default()
+                            {
+                                yield Ok(chunk_to_event(&cc));
+                            }
+                        }
+                        break 'stream;
+                    }
                 }
             };
 
@@ -459,13 +708,17 @@ pub fn build_stream_response(
 
             // 先按本批事件更新流状态，再决定注入。
             for ev in &events {
+                saw_any = true;
                 match ev {
                     CoreStreamEvent::MessageDelta { stop_reason: Some(_), .. } => {
                         saw_finish = true;
                     }
                     CoreStreamEvent::MessageStop => saw_stop = true,
                     CoreStreamEvent::MessageStart { .. } => saw_start = true,
-                    CoreStreamEvent::Error { .. } => saw_err = true,
+                    CoreStreamEvent::Error { message } => {
+                        saw_err = true;
+                        upstream_err_msg = Some(message.clone());
+                    }
                     _ => {}
                 }
             }
@@ -582,40 +835,61 @@ pub fn build_stream_response(
                 }
             }
         }
-        // 上游流自然耗尽但未产 MessageStop（协议缺终帧或提前 EOF）：
-        // 合成收尾——已开块补 BlockStop、缺 MessageDelta 补一帧、补 MessageStop，
-        // 否则客户端的块/消息状态机永远收不了尾。带内错误流只补 MessageStop：
-        // 错误帧已是协议终态，再发 completed/delta 反而自相矛盾。
+        // 上游流自然耗尽但未产 MessageStop，分三种情形收尾：
+        // 1. 已见带内错误帧（saw_err）：错误帧已是协议终态，只补 MessageStop。
+        // 2. 未见 finish（!saw_finish）：上游没声明结束原因就 EOF = 异常终止——
+        //    空流或截断。四种上游协议都有终帧（chat 的 finish_reason/[DONE]、
+        //    responses 的 completed/incomplete、anthropic 的 message_delta+
+        //    message_stop、gemini 的 finishReason），缺失即上游违约而非
+        //    「协议缺终帧」。按错误收尾：已开块收口保住部分内容，发带内 Error +
+        //    MessageStop，usage/trace 如实记 error——绝不能用 EndTurn 把半截
+        //    回复伪造成正常完成（中转空流/断流就是这么被静默吞掉的）。
+        // 3. 有 finish 但缺 MessageStop（如 chat 上游漏发 [DONE]）：内容已完整，
+        //    只补客户端状态机需要的终结帧，仍记 ok。
         if !saw_stop && audit.failed.is_none() {
             let mut tail: Vec<CoreStreamEvent> = Vec::new();
             if saw_err {
                 // 上游已发过带内错误帧：只补 MessageStop 让客户端状态机收尾，
                 // 不再补 completed/delta——错误帧之后再说「完成」自相矛盾。
+                // （审计侧按下面 saw_err 的统一标记记 error）
                 tail.push(CoreStreamEvent::MessageStop);
             } else {
-                // 无 MessageStart 的罕见上游（罕见）：先补一帧，客户端才有
-                // 消息头可挂载
-                if !saw_start {
-                    tail.push(CoreStreamEvent::MessageStart {
-                        id: String::new(),
-                        model: String::new(),
-                    });
-                }
-                for idx in std::mem::take(&mut dec_state.open_blocks) {
-                    tail.push(CoreStreamEvent::BlockStop {
-                        index: idx,
-                        block: dec_state.blocks.get(&idx).cloned(),
-                    });
-                }
                 if !saw_finish {
-                    // 流已干净读尽（chunk 错误会走 failed 分支到不了这里）——
-                    // 上游没报停因按 end_turn 收尾：responses 入口缺它就不发
-                    // response.completed，chat 入口缺它就没有 finish_reason，
-                    // 客户端会一直挂着等终帧。
-                    tail.push(CoreStreamEvent::MessageDelta {
-                        stop_reason: Some(moonbridge_core::StopReason::EndTurn),
-                        usage: None,
-                    });
+                    let msg = if saw_any {
+                        "上游流未正常结束：缺少终止帧（疑似截断）".to_string()
+                    } else {
+                        "上游流未产出任何事件即结束".to_string()
+                    };
+                    audit.failed = Some(msg.clone());
+                    // 有内容流出但上游没给 MessageStart 的罕见情形才补帧——
+                    // 空流只发 Error + MessageStop，不伪造消息壳。
+                    if !saw_start && saw_any {
+                        tail.push(CoreStreamEvent::MessageStart {
+                            id: String::new(),
+                            model: String::new(),
+                        });
+                    }
+                    for idx in std::mem::take(&mut dec_state.open_blocks) {
+                        tail.push(CoreStreamEvent::BlockStop {
+                            index: idx,
+                            block: dec_state.blocks.get(&idx).cloned(),
+                        });
+                    }
+                    tail.push(CoreStreamEvent::Error { message: msg });
+                } else {
+                    // 无 MessageStart 的罕见上游：先补一帧，客户端才有消息头可挂载
+                    if !saw_start {
+                        tail.push(CoreStreamEvent::MessageStart {
+                            id: String::new(),
+                            model: String::new(),
+                        });
+                    }
+                    for idx in std::mem::take(&mut dec_state.open_blocks) {
+                        tail.push(CoreStreamEvent::BlockStop {
+                            index: idx,
+                            block: dec_state.blocks.get(&idx).cloned(),
+                        });
+                    }
                 }
                 tail.push(CoreStreamEvent::MessageStop);
             }
@@ -662,6 +936,15 @@ pub fn build_stream_response(
                 }
             }
         }
+        // 上游的带内错误帧（response.failed / anthropic error 等）是上游自己
+        // 宣告失败：无论终帧齐不齐都必须记 error，不能让错误流显示为成功。
+        // 标记放在收尾块之后——先让上面的分支按「还需不需要补终帧」正常发帧。
+        if saw_err && audit.failed.is_none() {
+            audit.failed = Some(match upstream_err_msg {
+                Some(m) => format!("上游以错误帧结束流: {m}"),
+                None => "上游以错误帧结束流".to_string(),
+            });
+        }
         if audit.failed.is_none() {
             audit.completed = true;
         }
@@ -695,6 +978,7 @@ mod tests {
             completed,
             up_asm: StreamAssembler::default(),
             down_asm: StreamAssembler::default(),
+            last_chunk_at: Instant::now(),
         }
     }
 

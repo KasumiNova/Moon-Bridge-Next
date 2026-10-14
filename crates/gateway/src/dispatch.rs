@@ -21,6 +21,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use moonbridge_core::{CoreRequest, Protocol, Usage};
 use moonbridge_protocol::{RawBody, RawMessage, RawStage, RawVerdict, ReqCtx, UpstreamRequest};
+use moonbridge_store::Database;
 use serde_json::Value;
 
 use crate::error::{GatewayError, Result};
@@ -38,8 +39,127 @@ use crate::usage;
 /// trace），且元组类型本身不方便直接写在语句里。
 type PluginAnswer = (u16, Vec<(String, String)>, RawBody);
 
+/// 飞行中审计兜底：`handle_request` 的 future 挂在 axum 连接上——客户端在响应
+/// 返回前断开（或进程退出/任务取消）时，整个 future 被静默 drop，`fail_audit` /
+/// `finish_audit` / `StreamAudit::Drop` 一个都轮不到：usage 与 trace 零记录，
+/// 上游只看到连接被掐（new-api 记 `client_gone`）。本 guard 在「正常返回」之外
+/// 的一切消失路径（取消、panic 回卷）补一条 `aborted` 记录，让幽灵请求可观测。
+///
+/// 注意**正常返回必须先 `disarm`**——否则 Ok/Err 路径已经写过审计的会被双写；
+/// 流式请求的后续生命周期由 `StreamAudit::Drop` 接管，不在本 guard 覆盖范围内。
+struct InflightAudit {
+    db: Arc<Database>,
+    trace_dir: Option<String>,
+    record_bodies: bool,
+    trace_retention: usize,
+    ctx: ReqCtx,
+    client_request: Value,
+    stream: bool,
+    armed: bool,
+    start: Instant,
+}
+
+impl InflightAudit {
+    fn new(
+        db: &Arc<Database>,
+        trace_dir: Option<&str>,
+        record_bodies: bool,
+        trace_retention: usize,
+        client_protocol: Protocol,
+        raw_body: &Value,
+    ) -> Self {
+        let mut ctx = ReqCtx::new(uuid::Uuid::new_v4().to_string(), client_protocol);
+        ctx.model_alias = raw_body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        InflightAudit {
+            db: db.clone(),
+            trace_dir: trace_dir.map(str::to_string),
+            record_bodies,
+            trace_retention,
+            ctx,
+            client_request: raw_body.clone(),
+            stream: raw_body
+                .get("stream")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            armed: true,
+            start: Instant::now(),
+        }
+    }
+
+    /// 正常走完的调用路径都要先解除武装（无论返回 Ok 还是 Err——Err 侧
+    /// `fail_audit` 已写过 error 记录）。
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InflightAudit {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let msg = "请求未完成即被取消（客户端断开、进程退出或 panic 回卷）";
+        tracing::warn!(
+            request_id = %self.ctx.request_id,
+            model = %self.ctx.model_alias,
+            client_protocol = %self.ctx.client_protocol,
+            "请求在响应返回前被丢弃，上游将观测到连接中断（client_gone）"
+        );
+        usage::record(
+            &self.db,
+            &self.ctx,
+            "",
+            &Usage::default(),
+            "aborted",
+            Some(msg),
+            self.start,
+            None,
+        );
+        let mut t = new_trace(
+            &self.ctx,
+            self.client_request.clone(),
+            self.stream,
+            String::new(),
+            String::new(),
+            None,
+            Value::Null,
+        );
+        t.status = "aborted".to_string();
+        t.error = Some(msg.to_string());
+        if !self.record_bodies {
+            crate::trace::strip_bodies(&mut t);
+        }
+        crate::trace::write(self.trace_dir.as_deref(), &t, self.trace_retention);
+    }
+}
+
 /// 处理一次入口请求，返回 axum 响应（流式 SSE 或非流式 JSON）。
 pub async fn handle_request(
+    state: Arc<AppState>,
+    client_protocol: Protocol,
+    raw_body: Value,
+    req_headers: Vec<(String, String)>,
+    session_id: Option<String>,
+) -> Result<Response> {
+    let inflight = InflightAudit::new(
+        &state.db,
+        state.config.trace_dir.as_deref(),
+        state.config.trace_record_bodies,
+        state.config.trace_retention,
+        client_protocol,
+        &raw_body,
+    );
+    let resp = run_request(state, client_protocol, raw_body, req_headers, session_id).await;
+    // 返回点唯一的收口：inner 返回即正常（含 Err——错误路径已自行审计）
+    inflight.disarm();
+    resp
+}
+
+async fn run_request(
     state: Arc<AppState>,
     client_protocol: Protocol,
     raw_body: Value,
@@ -531,7 +651,7 @@ pub async fn handle_request(
         // trace 骨架（请求侧；响应侧回程时补齐）；`plugin_round` 即已发生的重试次数。
         let mut trace = new_trace(
             &ctx,
-            client_request_snapshot,
+            client_request_snapshot.clone(),
             core_req.stream,
             resolved.upstream_model.clone(),
             resolved.provider_key.clone(),
@@ -540,15 +660,109 @@ pub async fn handle_request(
         );
         trace.retries = plugin_round;
         return if core_req.stream {
-            Ok(stream::build_stream_response(
-                state,
-                ctx,
-                resp,
-                resolved.upstream_model,
-                start,
-                trace,
-                session_tag,
-            ))
+            // ── 流头窥视：上游 200 之后、内容事件之前仍可能以带内错误帧
+            // （`response.failed` 等）宣告失败——此时客户端一个字节都没收到，
+            // 整个请求可安全重发。零产出失败交给插件错误钩子判定
+            // （`on_upstream_response_raw` 的 error 路径；`Retry` → 重走端点链），
+            // 有内容则照常接管——已产出内容的流不可重试。
+            let provider_stream = state.registry.provider_stream(used_protocol);
+            let head = match &provider_stream {
+                Some(ps) => {
+                    stream::peek_upstream_head(
+                        resp,
+                        ps.as_ref(),
+                        &ctx,
+                        used_protocol,
+                        Some(resolved.provider_key.clone()),
+                        state.config.stream_idle_timeout_secs,
+                    )
+                    .await
+                }
+                None => Ok(stream::StreamHead::unpeeked(
+                    resp,
+                    used_protocol,
+                    Some(resolved.provider_key.clone()),
+                )),
+            };
+            let retryable_err = match &head {
+                Ok(h) => h.retryable_failure(),
+                Err(e) => Some(e.to_string()),
+            };
+            if let Some(err_msg) = retryable_err {
+                let mut inbound_resp = RawMessage {
+                    stage: RawStage::UpstreamResponse,
+                    protocol: used_protocol,
+                    provider: Some(resolved.provider_key.clone()),
+                    method: Some(up.method.to_string()),
+                    url: Some(up.url.clone()),
+                    // 上游 HTTP 层是 200——失败在流内宣告，如实记录状态码与 error 标记
+                    status: Some(200),
+                    headers: match &head {
+                        Ok(h) => h.resp_headers.clone(),
+                        Err(_) => Vec::new(),
+                    },
+                    body: RawBody::Text {
+                        text: err_msg.clone(),
+                    },
+                    error: true,
+                    session_id: ctx.session_id.clone(),
+                };
+                match state
+                    .hooks
+                    .on_upstream_response_raw(&ctx, &mut inbound_resp)
+                    .await
+                {
+                    Ok(RawVerdict::Retry { delay_ms })
+                        if plugin_round < state.config.plugin_retry_max =>
+                    {
+                        let delay = std::time::Duration::from_millis(
+                            delay_ms.min(state.config.plugin_retry_delay_cap_ms),
+                        );
+                        tracing::warn!(
+                            provider = %resolved.provider_key,
+                            attempt = plugin_round + 1,
+                            delay_ms = delay.as_millis() as u64,
+                            error = %err_msg,
+                            "上游流零产出即失败，插件要求重试"
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    Ok(RawVerdict::ShortCircuit {
+                        status,
+                        headers,
+                        body,
+                    }) => {
+                        return Ok(answered(
+                            &state,
+                            &ctx,
+                            start,
+                            trace,
+                            Usage::default(),
+                            status,
+                            headers,
+                            body,
+                        ));
+                    }
+                    Ok(RawVerdict::Abort { message }) => {
+                        return Err(aborted(&state, &ctx, start, trace, message))
+                    }
+                    // 放行 / 重试配额耗尽：照常接管，流内错误帧如实透传客户端
+                    _ => {}
+                }
+            }
+            match head {
+                Ok(head) => Ok(stream::build_stream_response(
+                    state,
+                    ctx,
+                    head,
+                    resolved.upstream_model,
+                    start,
+                    trace,
+                    session_tag,
+                )),
+                Err(e) => Err(fail_audit(&state, &ctx, start, trace, e)),
+            }
         } else {
             non_stream(state, ctx, resp, used_protocol, start, trace, session_tag).await
         };
@@ -1338,5 +1552,59 @@ mod tests {
         ob.body = RawBody::Empty;
         assert!(apply_outbound(&mut u, ob).is_ok());
         assert_eq!(u.body["model"], "original");
+    }
+
+    /// 回归：`handle_request` 的 future 在返回响应前被丢（客户端断开/进程退出）
+    /// 时，usage 与 trace 必须留下 aborted 记录——否则上游观测到的 client_gone
+    /// 在本地无任何痕迹可查（历史上这类请求完全隐形）。
+    #[test]
+    fn inflight_audit_writes_aborted_on_drop() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let dir = std::env::temp_dir().join(format!("mb-inflight-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let _guard = InflightAudit::new(
+                &db,
+                Some(&dir.to_string_lossy()),
+                true,
+                0,
+                Protocol::OpenAiChat,
+                &json!({"model": "m1", "stream": true}),
+            );
+            // 不 disarm 直接析构，模拟 future 被取消
+        }
+        let recs = db
+            .query_usage(&moonbridge_store::models::UsageQuery {
+                status: Some("aborted".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(recs.len(), 1, "被丢的 in-flight 请求应补记一条 aborted");
+        assert_eq!(recs[0].model.as_deref(), Some("m1"));
+        assert!(recs[0].error.as_deref().unwrap_or("").contains("被取消"));
+        // trace 也应落盘（request_id 目录下）
+        assert!(
+            std::fs::read_dir(&dir)
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false),
+            "trace 目录应有记录文件"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// disarm 后析构（正常返回路径）不得写任何记录——否则所有请求都会双写。
+    #[test]
+    fn inflight_audit_disarmed_writes_nothing() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        InflightAudit::new(
+            &db,
+            None,
+            true,
+            0,
+            Protocol::OpenAiChat,
+            &json!({"model": "m1"}),
+        )
+        .disarm();
+        assert_eq!(db.usage_summary().unwrap().requests, 0);
     }
 }

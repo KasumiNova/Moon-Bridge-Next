@@ -216,6 +216,153 @@ async fn e2e_stream_responses_to_anthropic() {
     );
 }
 
+/// 起一个返回固定 SSE 正文的 mock Anthropic 上游（流式路径专用：正文即整个响应体）。
+async fn spawn_mock_sse_body(sse: &'static str) -> String {
+    let app = Router::new().route(
+        "/v1/messages",
+        post(move || async move {
+            Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Body::from(sse))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+async fn collect_stream(state: Arc<AppState>) -> String {
+    let body = json!({
+        "model": "test-model",
+        "max_tokens": 128,
+        "messages": [{ "role": "user", "content": "Hi" }],
+        "stream": true
+    });
+    let resp = dispatch::handle_request(state, Protocol::Anthropic, body, vec![], None)
+        .await
+        .expect("dispatch 应成功");
+    assert_eq!(resp.status(), 200);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
+/// 回归（NewAPI 中转断流）：上游 SSE 有内容但干净 EOF、从未发终帧。
+/// 历史缺陷是把截断伪造成正常完成记 ok；现在必须向下游发带内 error
+/// 事件、保留已产出的部分内容，并把请求记为 error。
+#[tokio::test]
+async fn e2e_stream_truncated_eof_reports_error() {
+    let sse = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-x\",\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        // 无 message_delta / message_stop——连接干净 EOF（中转断流的典型形态）
+    );
+    let (state, db) = setup_with(
+        "anthropic",
+        spawn_mock_sse_body(sse).await,
+        "claude-x",
+        "test-model",
+    )
+    .await;
+    let text = collect_stream(state).await;
+
+    assert!(text.contains("partial"), "已产出内容应保留: {text}");
+    assert!(
+        text.contains("\"type\":\"error\""),
+        "截断流应发带内 error 事件: {text}"
+    );
+    let rows = db
+        .query_usage(&UsageQuery {
+            limit: 5,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].status.as_deref(),
+        Some("error"),
+        "缺终帧的截断流不得记 ok"
+    );
+    assert!(
+        rows[0].error.as_deref().unwrap_or("").contains("终止帧"),
+        "错误应说明缺终止帧: {:?}",
+        rows[0].error
+    );
+}
+
+/// 回归：上游 200 + 零事件空流（NewAPI 空转的实测形态）——不得伪造消息壳，
+/// 发 Error + 终结帧，记 error。
+#[tokio::test]
+async fn e2e_stream_empty_eof_reports_error() {
+    let (state, db) = setup_with(
+        "anthropic",
+        spawn_mock_sse_body("").await,
+        "claude-x",
+        "test-model",
+    )
+    .await;
+    let text = collect_stream(state).await;
+
+    assert!(
+        text.contains("\"type\":\"error\""),
+        "空流应发带内 error 事件: {text}"
+    );
+    assert!(
+        !text.contains("message_start"),
+        "空流不得伪造消息壳: {text}"
+    );
+    let rows = db
+        .query_usage(&UsageQuery {
+            limit: 5,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rows[0].status.as_deref(), Some("error"), "空流不得记 ok");
+}
+
+/// 上游主动发错误帧（anthropic error 事件）后 EOF：上游自己宣告失败，
+/// 请求必须记 error——错误帧后即使缺终帧也不能记 ok。
+#[tokio::test]
+async fn e2e_stream_upstream_error_frame_records_error() {
+    let sse = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-x\",\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"upstream overloaded\"}}\n\n",
+        // 上游发 error 后干净 EOF，无 message_delta / message_stop
+    );
+    let (state, db) = setup_with(
+        "anthropic",
+        spawn_mock_sse_body(sse).await,
+        "claude-x",
+        "test-model",
+    )
+    .await;
+    let text = collect_stream(state).await;
+
+    assert!(text.contains("\"type\":\"error\""), "错误帧应透传: {text}");
+    let rows = db
+        .query_usage(&UsageQuery {
+            limit: 5,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        rows[0].status.as_deref(),
+        Some("error"),
+        "上游错误帧不得记 ok"
+    );
+}
+
 // ============================================================================
 // M6 全矩阵：更多 mock 上游 + 通用装配 + 跨协议链路
 // ============================================================================
@@ -1770,6 +1917,124 @@ async fn e2e_plugin_retry_exhaustion_reports_upstream_520() {
         "错误摘要应含上游状态码: {t}"
     );
     let _ = std::fs::remove_dir_all(&trace_dir);
+}
+
+/// 流内零产出失败自愈（cctq/new-api 实测形态）：上游 200 + `error` 事件帧宣告失败，
+/// 客户端还什么都没收到——插件错误钩子返回 retry，网关重发，客户端最终拿到正常流。
+#[tokio::test]
+async fn e2e_plugin_retry_recovers_stream_inband_failure() {
+    /// 命中 `msg.error` 就重试——流内失败的合成报文 status=200、error=true。
+    const RETRY_ON_ANY_ERROR_PLUGIN: &str = r#"
+MB = { version = "0.1.0", capabilities = { "raw_response" } }
+function MB.on_upstream_response_raw(ctx, msg)
+  if msg.error then return { action = "retry", delay_ms = 1 } end
+end
+"#;
+    // 计数型 mock：首击回 200 + error 帧（上游宣告失败），第二击回正常流。
+    async fn handler(
+        axum::extract::State((hits, _)): axum::extract::State<(Arc<AtomicUsize>, ())>,
+    ) -> Response {
+        let sse = if hits.fetch_add(1, Ordering::SeqCst) == 0 {
+            concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"model\":\"claude-x\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+                "event: error\n",
+                "data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Upstream request failed\"}}\n\n",
+            )
+        } else {
+            concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-x\",\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+                "event: content_block_start\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+                "event: content_block_stop\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n",
+                "event: message_stop\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            )
+        };
+        Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from(sse))
+            .unwrap()
+    }
+    let hits = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/v1/messages", post(handler))
+        .with_state((hits.clone(), ()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base_url = format!("http://{addr}");
+
+    let (state, db, trace_dir) = seed_lua_state(
+        "retry-inband",
+        RETRY_ON_ANY_ERROR_PLUGIN,
+        &["raw_response"],
+        base_url,
+    )
+    .await;
+    let text = collect_stream(state).await;
+
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "零产出失败应重发一次");
+    assert!(
+        text.contains("Hello"),
+        "客户端应拿到重试后的正常内容: {text}"
+    );
+    assert!(
+        text.contains("message_stop"),
+        "重试后的流应正常收尾: {text}"
+    );
+    assert_eq!(db.usage_summary().unwrap().requests, 1, "重试轮不单独记账");
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let files = trace_json_files(&trace_dir);
+    assert_eq!(files.len(), 1);
+    let t: Value = serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+    assert_eq!(t["status"], "ok", "{t}");
+    assert_eq!(t["retries"], 1, "流内失败的重试次数要留痕: {t}");
+    let _ = std::fs::remove_dir_all(&trace_dir);
+}
+
+/// 流内零产出失败 + 插件放行：错误帧照常透传客户端并记 error（不吞）。
+#[tokio::test]
+async fn e2e_stream_inband_failure_passes_through_when_plugin_passes() {
+    /// 只观测、永不重试。
+    const OBSERVE_PLUGIN: &str = r#"
+MB = { version = "0.1.0", capabilities = { "raw_response" } }
+function MB.on_upstream_response_raw(ctx, msg)
+  return nil
+end
+"#;
+    let sse = concat!(
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Upstream request failed\"}}\n\n",
+    );
+    let (state, db, _trace_dir) = seed_lua_state(
+        "inband-pass",
+        OBSERVE_PLUGIN,
+        &["raw_response"],
+        spawn_mock_sse_body(sse).await,
+    )
+    .await;
+    let text = collect_stream(state).await;
+    assert!(
+        text.contains("\"type\":\"error\""),
+        "插件放行时错误帧应透传客户端: {text}"
+    );
+    let rows = db
+        .query_usage(&UsageQuery {
+            limit: 5,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rows[0].status.as_deref(), Some("error"));
 }
 
 /// 非流式 `request_timeout_secs` 是整条请求的总预算，插件重试必须共享它：
